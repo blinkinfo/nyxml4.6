@@ -12,7 +12,7 @@ from telegram.ext import Application
 import config as cfg
 from bot import handlers
 from core.scheduler import recover_unresolved, start_scheduler
-from db.models import cleanup_bad_redemptions, init_db, migrate_db
+from db.models import init_db, migrate_db
 from polymarket.client import PolymarketClient
 
 logging.basicConfig(
