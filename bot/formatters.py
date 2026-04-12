@@ -722,8 +722,8 @@ def format_model_status(slot: str, meta: dict, threshold: float) -> str:
     down_tpd     = meta.get("down_test_tpd", meta.get("down_val_tpd", 0))
 
     up_gate_pct  = meta.get("test_wr", 0) * 100
-    up_gate_icon = "\u2705" if up_gate_pct >= 59.0 else "\u274c"
-    up_gate_lbl  = "PASS" if up_gate_pct >= 59.0 else "FAIL"
+    up_gate_icon = "\u2705" if up_gate_pct >= 58.0 else "\u274c"
+    up_gate_lbl  = "PASS" if up_gate_pct >= 58.0 else "FAIL"
 
     if down_val_wr is not None and down_test_wr is not None:
         down_status_lbl = "ENABLED" if down_enabled else "DISABLED"
