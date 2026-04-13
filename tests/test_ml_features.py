@@ -170,6 +170,105 @@ def test_asof_backward_nat_handling():
     assert result['val_a'].iloc[1:].notna().any(), "Valid timestamp rows should resolve to non-NaN"
 
 
+def test_live_features_match_training_for_latest_closed_5m_row():
+    """Live feature builder must match training feature row semantics exactly.
+
+    Contract:
+      - Predict N+1 using data up to N-1 (exclude in-progress 5m candle N).
+      - 15m/1h context is selected by timestamp <= ts_n1, not by blindly
+        dropping the latest higher-timeframe row.
+
+    This test builds synthetic aligned 5m/15m/1h/funding/CVD data, then checks
+    that build_live_features(...) equals the corresponding row from
+    build_features(...), feature-by-feature.
+    """
+    from collections import deque
+    from ml.features import build_features, build_live_features
+
+    rng = np.random.default_rng(7)
+    n5 = 450
+
+    ts_5m = pd.date_range("2026-01-01", periods=n5, freq="5min", tz="UTC")
+    close = 50000 + np.cumsum(rng.normal(0, 20, n5))
+    open_ = close + rng.normal(0, 5, n5)
+    high = np.maximum(open_, close) + rng.uniform(0, 8, n5)
+    low = np.minimum(open_, close) - rng.uniform(0, 8, n5)
+    vol = rng.uniform(50, 200, n5)
+
+    df5 = pd.DataFrame(
+        {
+            "timestamp": ts_5m,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": vol,
+        }
+    )
+
+    s = df5.set_index("timestamp")
+    df15 = (
+        s.resample("15min")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        .dropna()
+        .reset_index()
+    )
+    df1h = (
+        s.resample("1h")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        .dropna()
+        .reset_index()
+    )
+
+    funding_ts = pd.date_range(
+        ts_5m.min() - pd.Timedelta("16h"),
+        ts_5m.max() + pd.Timedelta("1h"),
+        freq="8h",
+        tz="UTC",
+    )
+    funding = pd.DataFrame(
+        {
+            "timestamp": funding_ts,
+            "funding_rate": rng.normal(0, 0.0001, len(funding_ts)),
+        }
+    )
+
+    buy = rng.uniform(30, 120, n5)
+    sell = rng.uniform(30, 120, n5)
+    cvd = pd.DataFrame(
+        {
+            "timestamp": ts_5m,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": vol,
+            "buy_vol": buy,
+            "sell_vol": sell,
+        }
+    )
+
+    # Training features on full history
+    train_feat = build_features(df5, df15, df1h, funding, cvd)
+    expected = train_feat[FEATURE_COLS].iloc[-2].to_numpy()
+
+    # Live path semantics:
+    #   - drop in-progress 5m candle only
+    #   - keep 15m/1h history; builder itself applies <= ts_n1 filtering
+    live_row = build_live_features(
+        df5.iloc[:-1].copy(),
+        df15.copy(),
+        df1h.copy(),
+        float(funding["funding_rate"].iloc[-1]),
+        deque(funding["funding_rate"].tail(24).tolist(), maxlen=24),
+        cvd.iloc[:-1].copy(),
+    )
+
+    assert live_row is not None
+    got = live_row[0]
+    np.testing.assert_allclose(got, expected, rtol=0.0, atol=1e-12)
+
+
 def test_fetch_funding_mock():
     """Verify fetch_funding() behaviour using mocked ccxt and MEXC REST API.
 

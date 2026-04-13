@@ -229,11 +229,15 @@ class MLStrategy(BaseStrategy):
                 loop.run_in_executor(None, lambda: data_fetcher.fetch_live_cvd(400)),
             )
 
-            # Drop the still-forming (last) candle from each OHLCV DataFrame
-            # so live features are built only from fully-closed candles.
+            # Drop the still-forming 5m candle so inference uses data only up to N-1.
+            #
+            # IMPORTANT PARITY NOTE:
+            # We intentionally do NOT drop the last 15m/1h rows here.
+            # build_live_features() already selects the most recent 15m/1h candle
+            # with timestamp <= ts_n1 (where ts_n1 is the closed 5m N-1 candle).
+            # Dropping 15m/1h pre-emptively can shift those context features one
+            # bucket stale vs training and create train/live feature drift.
             df5 = df5.iloc[:-1].reset_index(drop=True)
-            df15 = df15.iloc[:-1].reset_index(drop=True)
-            df1h = df1h.iloc[:-1].reset_index(drop=True)
             cvd_live = cvd_live.iloc[:-1].reset_index(drop=True) if cvd_live is not None and len(cvd_live) > 0 else cvd_live
 
             # Update funding rolling buffer — only append when a new 8h settlement
