@@ -17,6 +17,7 @@ from core.strategies.base import BaseStrategy
 from ml import data_fetcher
 from ml import features as feat_eng
 from ml import model_store
+from ml import inference_logger
 from db import queries
 from polymarket.markets import get_next_slot_info, get_slot_prices
 import config as cfg
@@ -197,6 +198,10 @@ class MLStrategy(BaseStrategy):
 
         # Get next slot info — identical pattern to PatternStrategy
         slot_n1 = get_next_slot_info()
+        slug = slot_n1["slug"]
+        slot_ts = slot_n1["slot_start_ts"]
+        slot_start_str = slot_n1["slot_start_str"]
+        slot_end_str = slot_n1["slot_end_str"]
 
         # Standard base fields used in all return dicts (matches PatternStrategy exactly)
         base_fields: dict[str, Any] = {
@@ -205,16 +210,23 @@ class MLStrategy(BaseStrategy):
             "candles_used": 400,
             "slot_n1_start_full": slot_n1["slot_start_full"],
             "slot_n1_end_full":   slot_n1["slot_end_full"],
-            "slot_n1_start_str":  slot_n1["slot_start_str"],
-            "slot_n1_end_str":    slot_n1["slot_end_str"],
-            "slot_n1_ts":         slot_n1["slot_start_ts"],
-            "slot_n1_slug":       slot_n1["slug"],
+            "slot_n1_start_str":  slot_start_str,
+            "slot_n1_end_str":    slot_end_str,
+            "slot_n1_ts":         slot_ts,
+            "slot_n1_slug":       slug,
         }
 
         if self._model is None:
             self._load_model()
             if self._model is None:
-                log.error("MLStrategy: no model loaded, skipping slot %s", slot_n1["slug"])
+                log.error("MLStrategy: no model loaded, skipping slot %s", slug)
+                inference_logger.log_skipped_data(
+                    slot_slug=slug,
+                    slot_ts=slot_ts,
+                    slot_start_str=slot_start_str,
+                    slot_end_str=slot_end_str,
+                    skip_reason="No model loaded",
+                )
                 return {**base_fields, "reason": "No model loaded"}
 
         try:
@@ -228,6 +240,12 @@ class MLStrategy(BaseStrategy):
                 loop.run_in_executor(None, lambda: data_fetcher.fetch_live_cvd(400)),
             )
 
+            # --- Data quality snapshot (before dropping the forming candle) ---
+            df5_rows_raw  = len(df5)        if df5       is not None else 0
+            df15_rows     = len(df15)       if df15      is not None else 0
+            df1h_rows     = len(df1h)       if df1h      is not None else 0
+            cvd_rows_raw  = len(cvd_live)   if cvd_live  is not None and len(cvd_live) > 0 else 0
+
             # Drop the still-forming 5m candle so inference uses data only up to N-1.
             #
             # IMPORTANT PARITY NOTE:
@@ -238,6 +256,25 @@ class MLStrategy(BaseStrategy):
             # bucket stale vs training and create train/live feature drift.
             df5 = df5.iloc[:-1].reset_index(drop=True)
             cvd_live = cvd_live.iloc[:-1].reset_index(drop=True) if cvd_live is not None and len(cvd_live) > 0 else cvd_live
+
+            # Row counts after trimming (what the model actually sees)
+            df5_rows  = len(df5)
+            cvd_rows  = len(cvd_live) if cvd_live is not None and len(cvd_live) > 0 else 0
+
+            # N-1 candle metadata for the log
+            candle_n1_ts    = None
+            candle_n1_close = None
+            candle_n1_vol   = None
+            if df5_rows >= 2:
+                try:
+                    import pandas as _pd
+                    n1 = df5.iloc[-1]
+                    ts_raw = n1.get("timestamp") if hasattr(n1, "get") else n1["timestamp"]
+                    candle_n1_ts    = str(_pd.Timestamp(ts_raw, tz="UTC").isoformat()) if ts_raw is not None else None
+                    candle_n1_close = float(n1["close"])
+                    candle_n1_vol   = float(n1["volume"])
+                except Exception:
+                    pass  # non-critical — log will just show None
 
             # Update funding rolling buffer — only append when a new 8h settlement
             # has occurred, matching training data semantics (one entry per settlement
@@ -252,12 +289,40 @@ class MLStrategy(BaseStrategy):
                         current_settlement.isoformat(), funding_rate, len(self._funding_buffer),
                     )
 
-            # Build feature row
-            feature_row = feat_eng.build_live_features(
+            funding_buf_len = len(self._funding_buffer)
+
+            # Build feature row — returns (row, nan_features) 2-tuple
+            feature_row, nan_features = feat_eng.build_live_features(
                 df5, df15, df1h, funding_rate, self._funding_buffer, cvd_live
             )
             if feature_row is None:
                 log.warning("MLStrategy: insufficient data for features, skipping")
+                inference_logger.log_inference(
+                    slot_slug=slug,
+                    slot_ts=slot_ts,
+                    slot_start_str=slot_start_str,
+                    slot_end_str=slot_end_str,
+                    df5_rows=df5_rows,
+                    df15_rows=df15_rows,
+                    df1h_rows=df1h_rows,
+                    cvd_rows=cvd_rows,
+                    funding_buf_len=funding_buf_len,
+                    candle_n1_ts=candle_n1_ts,
+                    candle_n1_close=candle_n1_close,
+                    candle_n1_vol=candle_n1_vol,
+                    feature_names=FEATURE_COLS,
+                    feature_row=None,
+                    nan_features=nan_features,
+                    p_up=None,
+                    p_down=None,
+                    up_threshold=None,
+                    down_threshold=None,
+                    down_enabled=False,
+                    fired=False,
+                    side=None,
+                    skip_reason="Insufficient data for features"
+                    + (f" (NaN: {nan_features})" if nan_features else ""),
+                )
                 return {**base_fields, "reason": "Insufficient data for features"}
 
             # Model inference — P(UP) as a single float in [0, 1]
@@ -302,13 +367,38 @@ class MLStrategy(BaseStrategy):
                     down_reason = "DOWN disabled (not validated)"
                 else:
                     down_reason = f"p_down={prob_down:.4f}<{down_threshold:.3f}"
+                skip_reason = (
+                    f"Below threshold (p_up={prob:.4f}<{up_threshold:.3f}, {down_reason})"
+                )
+                inference_logger.log_inference(
+                    slot_slug=slug,
+                    slot_ts=slot_ts,
+                    slot_start_str=slot_start_str,
+                    slot_end_str=slot_end_str,
+                    df5_rows=df5_rows,
+                    df15_rows=df15_rows,
+                    df1h_rows=df1h_rows,
+                    cvd_rows=cvd_rows,
+                    funding_buf_len=funding_buf_len,
+                    candle_n1_ts=candle_n1_ts,
+                    candle_n1_close=candle_n1_close,
+                    candle_n1_vol=candle_n1_vol,
+                    feature_names=FEATURE_COLS,
+                    feature_row=feature_row,
+                    nan_features=[],
+                    p_up=prob,
+                    p_down=prob_down,
+                    up_threshold=up_threshold,
+                    down_threshold=down_threshold,
+                    down_enabled=down_enabled,
+                    fired=False,
+                    side=None,
+                    skip_reason=skip_reason,
+                )
                 return {
                     **base_fields,
                     "pattern": f"p={prob:.4f}<{up_threshold:.3f}",
-                    "reason": (
-                        f"Below threshold (p_up={prob:.4f}<{up_threshold:.3f}, "
-                        f"{down_reason})"
-                    ),
+                    "reason": skip_reason,
                     # Structured ML fields for rich Telegram formatting
                     "ml_p_up": prob,
                     "ml_p_down": prob_down,
@@ -321,14 +411,39 @@ class MLStrategy(BaseStrategy):
                 "MLStrategy: side=%s p_up=%.4f p_down=%.4f up_thr=%.3f down_thr=%.3f "
                 "down_enabled=%s slot=%s",
                 side, prob, prob_down, up_threshold, down_threshold,
-                down_enabled, slot_n1["slug"],
+                down_enabled, slug,
             )
 
             # Fetch Polymarket prices — identical to PatternStrategy
-            prices = await get_slot_prices(slot_n1["slug"])
+            prices = await get_slot_prices(slug)
             if prices is None:
                 log.warning(
-                    "MLStrategy: no Polymarket prices for slug=%s, skipping", slot_n1["slug"]
+                    "MLStrategy: no Polymarket prices for slug=%s, skipping", slug
+                )
+                inference_logger.log_inference(
+                    slot_slug=slug,
+                    slot_ts=slot_ts,
+                    slot_start_str=slot_start_str,
+                    slot_end_str=slot_end_str,
+                    df5_rows=df5_rows,
+                    df15_rows=df15_rows,
+                    df1h_rows=df1h_rows,
+                    cvd_rows=cvd_rows,
+                    funding_buf_len=funding_buf_len,
+                    candle_n1_ts=candle_n1_ts,
+                    candle_n1_close=candle_n1_close,
+                    candle_n1_vol=candle_n1_vol,
+                    feature_names=FEATURE_COLS,
+                    feature_row=feature_row,
+                    nan_features=[],
+                    p_up=prob,
+                    p_down=prob_down,
+                    up_threshold=up_threshold,
+                    down_threshold=down_threshold,
+                    down_enabled=down_enabled,
+                    fired=False,
+                    side=side,
+                    skip_reason="Market data unavailable (no Polymarket prices)",
                 )
                 return {
                     **base_fields,
@@ -348,6 +463,33 @@ class MLStrategy(BaseStrategy):
             opposite_price = prices["down_price"]  if side == "Up" else prices["up_price"]
             token_id          = prices["up_token_id"] if side == "Up" else prices["down_token_id"]
             opposite_token_id = prices["down_token_id"] if side == "Up" else prices["up_token_id"]
+
+            # Log the fired inference record
+            inference_logger.log_inference(
+                slot_slug=slug,
+                slot_ts=slot_ts,
+                slot_start_str=slot_start_str,
+                slot_end_str=slot_end_str,
+                df5_rows=df5_rows,
+                df15_rows=df15_rows,
+                df1h_rows=df1h_rows,
+                cvd_rows=cvd_rows,
+                funding_buf_len=funding_buf_len,
+                candle_n1_ts=candle_n1_ts,
+                candle_n1_close=candle_n1_close,
+                candle_n1_vol=candle_n1_vol,
+                feature_names=FEATURE_COLS,
+                feature_row=feature_row,
+                nan_features=[],
+                p_up=prob,
+                p_down=prob_down,
+                up_threshold=up_threshold,
+                down_threshold=down_threshold,
+                down_enabled=down_enabled,
+                fired=True,
+                side=side,
+                skip_reason=None,
+            )
 
             return {
                 **base_fields,

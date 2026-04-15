@@ -254,7 +254,7 @@ def test_live_features_match_training_for_latest_closed_5m_row():
     # Live path semantics:
     #   - drop in-progress 5m candle only
     #   - keep 15m/1h history; builder itself applies <= ts_n1 filtering
-    live_row = build_live_features(
+    live_row, nan_features = build_live_features(
         df5.iloc[:-1].copy(),
         df15.copy(),
         df1h.copy(),
@@ -263,7 +263,8 @@ def test_live_features_match_training_for_latest_closed_5m_row():
         cvd.iloc[:-1].copy(),
     )
 
-    assert live_row is not None
+    assert live_row is not None, f"build_live_features returned None; nan_features={nan_features}"
+    assert nan_features == [], f"Unexpected NaN features: {nan_features}"
     got = live_row[0]
     np.testing.assert_allclose(got, expected, rtol=0.0, atol=1e-12)
 

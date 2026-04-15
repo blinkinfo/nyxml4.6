@@ -13,6 +13,7 @@ import config as cfg
 from core import strategy, trader, resolver
 from core import pending_queue
 from db import queries
+from ml import inference_logger
 import html as _html
 from polymarket.markets import SLOT_DURATION
 
@@ -93,6 +94,9 @@ async def _resolve_and_notify(signal_id: int, slug: str, side: str, entry_price:
 
     is_win = winner == side
     await queries.resolve_signal(signal_id, winner, is_win)
+
+    # Back-fill the outcome into the inference debug log (non-fatal if it fails)
+    inference_logger.log_outcome(slug, winner=winner, is_win=is_win)
 
     # Extract HH:MM from slot_start/slot_end full strings
     s_start = slot_start.split(" ")[-1] if " " in slot_start else slot_start
@@ -180,6 +184,9 @@ async def _reconcile_pending() -> None:
         # Resolved — update DB
         is_win = winner == side
         await queries.resolve_signal(signal_id, winner, is_win)
+
+        # Back-fill the outcome into the inference debug log (non-fatal if it fails)
+        inference_logger.log_outcome(slug, winner=winner, is_win=is_win)
 
         pnl: float | None = None
         if trade_id is not None and amount_usdc is not None:

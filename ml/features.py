@@ -294,14 +294,23 @@ def build_live_features(
     funding_rate_float: float | None,
     funding_buffer: deque,
     cvd_live: pd.DataFrame,
-) -> "np.ndarray | None":
+) -> "tuple[np.ndarray, list[str]] | tuple[None, list[str]]":
     """
     Build a single feature row (shape 1×26) for live inference.
-    Returns None if ATR warmup not satisfied (fewer than 14 candles).
+
+    Returns a 2-tuple (feature_row, nan_features):
+      - feature_row : np.ndarray shape (1, 26), or None on hard failure.
+      - nan_features: list of feature names that were NaN (empty on success).
+                      Populated even when feature_row is None so callers can
+                      log exactly which features caused the skip.
+
+    Returns (None, []) if ATR warmup is not satisfied (fewer than 14 candles).
+    Returns (None, [<name>, ...]) when one or more features are NaN.
+    Returns (row, []) on full success.
     """
     # Validate ATR warmup
     if len(df5_live) < 14:
-        return None
+        return None, []
 
     df5 = df5_live.copy().reset_index(drop=True)
     df15 = df15_live.copy().reset_index(drop=True)
@@ -314,7 +323,7 @@ def build_live_features(
 
     atr5 = compute_atr14(df5)
     if atr5.iloc[-1] is None or pd.isna(atr5.iloc[-1]):
-        return None
+        return None, []
 
     # 5m features using last row (index -1 = current candle N)
     # We use shift(1) = N-1
@@ -501,9 +510,9 @@ def build_live_features(
         hour_utc, dow, atr_percentile_24h, vol_regime,
     ]], dtype=np.float64)
 
-    if np.isnan(row).any():
-        nan_features = [FEATURE_COLS[i] for i in range(len(FEATURE_COLS)) if np.isnan(row[0][i])]
+    nan_features = [FEATURE_COLS[i] for i in range(len(FEATURE_COLS)) if np.isnan(row[0][i])]
+    if nan_features:
         log.warning("build_live_features: NaN in features, skipping inference. NaN features: %s", nan_features)
-        return None
+        return None, nan_features
 
-    return row
+    return row, []

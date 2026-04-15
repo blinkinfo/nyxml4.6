@@ -71,6 +71,15 @@ MEXC_CVD_URL: str = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT"
 ML_PAYOUT_RATIO: float = float(os.getenv("ML_PAYOUT_RATIO", "0.85"))
 
 # ---------------------------------------------------------------------------
+# Inference Debug Logging
+# ---------------------------------------------------------------------------
+# Path where per-inference structured JSONL logs are written.
+# Each line is a self-contained JSON record for one check_signal() call.
+# Outcome (win/loss) is back-filled when the slot resolves.
+# Set to "" or "none" to disable (not recommended in production).
+INFERENCE_LOG_PATH: str = os.getenv("INFERENCE_LOG_PATH", "inference_log.jsonl")
+
+# ---------------------------------------------------------------------------
 # Signal Timing
 # ---------------------------------------------------------------------------
 SIGNAL_LEAD_TIME: int = 85  # seconds before slot end to check signal
