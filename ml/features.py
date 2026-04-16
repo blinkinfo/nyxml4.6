@@ -7,11 +7,12 @@ Target semantics: 1 if the NEXT candle closes at or above its own open
 (close[i+1] >= open[i+1]), matching Polymarket's settlement logic
 (resolver.py: winner = "Up" if close_price >= open_price else "Down").
 
-37 features total: candle shape (7), volume (2), 15m context (3), 1h context (3),
+42 features total: candle shape (7), volume (2), 15m context (3), 1h context (3),
 funding (2), OHLCV pressure (5), time-of-day cyclical (4), volatility regime (2),
 momentum (4: rsi14, candle_streak, price_in_range, ema_cross_5m),
 structure (3: body_vs_range5, range_expansion, vwap_dist_20),
-Gate.io CVD taker flow (2: cvd_ratio, cvd_delta_norm).
+Gate.io CVD taker flow (7: cvd_ratio, cvd_delta_norm, cvd_cumulative_5,
+cvd_cumulative_20, cvd_trend_slope, cvd_divergence, oi_change_5bar).
 """
 
 from __future__ import annotations
@@ -41,8 +42,11 @@ FEATURE_COLS = [
     "rsi14", "candle_streak", "price_in_range", "ema_cross_5m",  # momentum features
     # structure features
     "body_vs_range5", "range_expansion", "vwap_dist_20",
-    # Gate.io CVD taker flow features (indices 35, 36)
+    # Gate.io CVD taker flow features (indices 35-41)
     "cvd_ratio", "cvd_delta_norm",
+    # CVD accumulation + open interest features (indices 37-41)
+    "cvd_cumulative_5", "cvd_cumulative_20", "cvd_trend_slope",
+    "cvd_divergence", "oi_change_5bar",
 ]
 
 
@@ -381,19 +385,150 @@ def build_features(
         cvd_clean["cvd_ratio"] = (cvd_clean["long_taker_size"] / _total).clip(0.0, 1.0)
         cvd_clean["cvd_delta"] = cvd_clean["long_taker_size"] - cvd_clean["short_taker_size"]
 
-        rcvd = _asof_backward(ts_n1, cvd_clean, ["cvd_ratio", "cvd_delta"])
+        # -----------------------------------------------------------------------
+        # CVD accumulation + OI features — computed on the CVD frame (per-bar),
+        # then merged onto df5 via _asof_backward exactly like cvd_ratio/delta.
+        #
+        # ALL use shift(k>=1) relative to the CVD frame so that when they are
+        # merged onto df5 at ts_n1 (N-1 bar timestamp) the values they carry
+        # correspond to history BEFORE N-1 — zero lookahead bias guaranteed.
+        #
+        # cvd_cumulative_5:  sum of cvd_delta over bars [t-5 .. t-1] (rolling 5,
+        #                    then shift 1), ATR-normalized.  Captures short-term
+        #                    directional buy/sell pressure accumulation.
+        #
+        # cvd_cumulative_20: same over bars [t-20 .. t-1] (rolling 20, shift 1).
+        #                    Medium-term flow regime.
+        #
+        # cvd_trend_slope:   Linear regression slope of cvd_delta over the 10-bar
+        #                    window [t-10 .. t-1] (rolling 10, shift 1), normalized
+        #                    by ATR.  Positive = buy pressure accelerating.
+        #                    Uses least-squares via polyfit on positions [0..9].
+        #
+        # cvd_divergence:    +1 if price direction (last 5 bars ending at t-1) and
+        #                    CVD direction (last 5 bars ending at t-1) disagree,
+        #                    -1 if they agree, 0 if either is flat.
+        #                    Classical divergence: price up + CVD falling = reversal.
+        #
+        # oi_change_5bar:    (oi[t-1] - oi[t-6]) / |oi[t-6]|  — percentage change
+        #                    in open interest over the prior 5 bars.  Positive =
+        #                    new positions opening (trend continuation bias).
+        #                    oi[t-6] is shift(6) so oi[t-1] = shift(1); diff is
+        #                    (shift(1) - shift(6)) / abs(shift(6)).
+        # -----------------------------------------------------------------------
+
+        # ATR proxy for CVD normalization: we need ATR at the CVD bar's own
+        # timestamp. We merge the ATR series from df5 onto cvd_clean via
+        # _asof_backward so each CVD bar gets the ATR of the corresponding
+        # 5m candle. Then we use that for normalization — not a fixed scalar.
+        _df5_atr = pd.DataFrame({
+            "timestamp": df5["timestamp"].values,
+            "atr5_for_cvd": atr5.values,
+        })
+        _atr_merged = _asof_backward(
+            cvd_clean["timestamp"], _df5_atr, ["atr5_for_cvd"]
+        )
+        _cvd_atr = _atr_merged["atr5_for_cvd"].clip(lower=1e-9).values
+
+        # cvd_cumulative_5: rolling sum of delta over 5 bars, then shift(1)
+        cvd_clean["cvd_cumulative_5"] = (
+            cvd_clean["cvd_delta"].rolling(5, min_periods=2).sum().shift(1)
+            / pd.Series(_cvd_atr).shift(1).clip(lower=1e-9)
+        )
+
+        # cvd_cumulative_20: rolling sum of delta over 20 bars, then shift(1)
+        cvd_clean["cvd_cumulative_20"] = (
+            cvd_clean["cvd_delta"].rolling(20, min_periods=5).sum().shift(1)
+            / pd.Series(_cvd_atr).shift(1).clip(lower=1e-9)
+        )
+
+        # cvd_trend_slope: OLS slope of cvd_delta over rolling 10-bar window, shift(1)
+        # polyfit on positions [0..9] — normalized by ATR
+        _x_slope = np.arange(10, dtype=np.float64)
+
+        def _slope(vals: np.ndarray) -> float:
+            """Return OLS slope of vals over positions 0..len-1."""
+            v = vals[~np.isnan(vals)]
+            if len(v) < 3:
+                return np.nan
+            x = np.arange(len(v), dtype=np.float64)
+            try:
+                return float(np.polyfit(x, v, 1)[0])
+            except Exception:
+                return np.nan
+
+        cvd_clean["cvd_trend_slope"] = (
+            cvd_clean["cvd_delta"]
+            .rolling(10, min_periods=3)
+            .apply(_slope, raw=True)
+            .shift(1)
+            / pd.Series(_cvd_atr).shift(1).clip(lower=1e-9)
+        )
+
+        # cvd_divergence: sign disagreement between price direction and CVD direction
+        # price_dir_5: sign of sum of (close-open) over last 5 bars, shift(1)
+        # We need price data on the CVD frame — merge df5 close/open via asof.
+        _df5_body = pd.DataFrame({
+            "timestamp": df5["timestamp"].values,
+            "body5_sum": (df5["close"] - df5["open"]).rolling(5, min_periods=2).sum().values,
+        })
+        _body_merged = _asof_backward(cvd_clean["timestamp"], _df5_body, ["body5_sum"])
+        _price_dir_5 = np.sign(_body_merged["body5_sum"].shift(1).values)
+        _cvd_dir_5 = np.sign(
+            cvd_clean["cvd_delta"].rolling(5, min_periods=2).sum().shift(1).values
+        )
+        # +1 = diverging (disagree), -1 = aligning (agree), 0 = either flat
+        _div_raw = np.where(
+            (_price_dir_5 == 0) | (_cvd_dir_5 == 0),
+            0.0,
+            np.where(_price_dir_5 != _cvd_dir_5, 1.0, -1.0),
+        )
+        cvd_clean["cvd_divergence"] = _div_raw
+
+        # oi_change_5bar: (oi_t-1 - oi_t-6) / |oi_t-6|
+        # open_interest column present when cvd_available (fetched from Gate.io)
+        _oi_col = "open_interest"
+        if _oi_col in cvd_clean.columns:
+            _oi_s1 = cvd_clean[_oi_col].shift(1)
+            _oi_s6 = cvd_clean[_oi_col].shift(6)
+            cvd_clean["oi_change_5bar"] = (
+                (_oi_s1 - _oi_s6) / _oi_s6.abs().clip(lower=1e-9)
+            )
+        else:
+            cvd_clean["oi_change_5bar"] = np.nan
+
+        _cvd_cols = [
+            "cvd_ratio", "cvd_delta",
+            "cvd_cumulative_5", "cvd_cumulative_20", "cvd_trend_slope",
+            "cvd_divergence", "oi_change_5bar",
+        ]
+        rcvd = _asof_backward(ts_n1, cvd_clean, _cvd_cols)
         df5["cvd_ratio"] = rcvd["cvd_ratio"].values
 
         # Normalize delta by ATR — use atr5 (already computed on df5)
         # Clip denominator away from zero to prevent inf/nan
         df5["cvd_delta_norm"] = rcvd["cvd_delta"].values / atr5.shift(1).clip(lower=1e-9).values
+
+        # Accumulation + OI features are already ATR-normalized on the CVD frame
+        df5["cvd_cumulative_5"]  = rcvd["cvd_cumulative_5"].values
+        df5["cvd_cumulative_20"] = rcvd["cvd_cumulative_20"].values
+        df5["cvd_trend_slope"]   = rcvd["cvd_trend_slope"].values
+        df5["cvd_divergence"]    = rcvd["cvd_divergence"].values
+        df5["oi_change_5bar"]    = rcvd["oi_change_5bar"].values
     else:
         log.warning(
             "build_features: CVD data not provided or empty — "
-            "using neutral defaults (cvd_ratio=0.5, cvd_delta_norm=0.0)"
+            "using neutral defaults (cvd_ratio=0.5, cvd_delta_norm=0.0, "
+            "cvd_cumulative_5=0.0, cvd_cumulative_20=0.0, cvd_trend_slope=0.0, "
+            "cvd_divergence=0.0, oi_change_5bar=0.0)"
         )
         df5["cvd_ratio"] = 0.5
         df5["cvd_delta_norm"] = 0.0
+        df5["cvd_cumulative_5"] = 0.0
+        df5["cvd_cumulative_20"] = 0.0
+        df5["cvd_trend_slope"] = 0.0
+        df5["cvd_divergence"] = 0.0
+        df5["oi_change_5bar"] = 0.0
 
     # -----------------------------------------------------------------------
     # Target: 1 if next candle closes >= its own open (future label, NOT a feature)
@@ -424,10 +559,10 @@ def build_live_features(
     cvd_live: pd.DataFrame | None = None,
 ) -> "tuple[np.ndarray, list[str]] | tuple[None, list[str]]":
     """
-    Build a single feature row (shape 1×37) for live inference.
+    Build a single feature row (shape 1×42) for live inference.
 
     Returns a 2-tuple (feature_row, nan_features):
-      - feature_row : np.ndarray shape (1, 37), or None on hard failure.
+      - feature_row : np.ndarray shape (1, 42), or None on hard failure.
       - nan_features: list of feature names that were NaN (empty on success).
                       Populated even when feature_row is None so callers can
                       log exactly which features caused the skip.
@@ -443,9 +578,11 @@ def build_live_features(
         funding_rate_float: Most recent funding rate float.
         funding_buffer:     Rolling deque of recent funding rates.
         cvd_live:           Gate.io 5m taker volume DataFrame
-                            (columns: timestamp, long_taker_size, short_taker_size).
-                            If None or empty, cvd_ratio defaults to 0.5 and
-                            cvd_delta_norm to 0.0 (neutral — no bias applied).
+                            (columns: timestamp, long_taker_size, short_taker_size,
+                            open_interest).
+                            If None or empty, cvd_ratio defaults to 0.5,
+                            cvd_delta_norm to 0.0, and all accumulation/OI
+                            features to 0.0 (neutral — no bias applied).
     """
     # Validate ATR warmup
     if len(df5_live) < 14:
@@ -801,11 +938,20 @@ def build_live_features(
     # Gate.io CVD taker flow features (live)
     #
     # Mirrors build_features() exactly:
-    #   cvd_ratio     = long_taker_size / (long + short), clamped [0, 1]
-    #   cvd_delta_norm = (long - short) / atr5_val  (ATR-normalized)
+    #   cvd_ratio          = long_taker_size / (long + short), clamped [0, 1]
+    #   cvd_delta_norm     = (long - short) / atr5_val  (ATR-normalized)
+    #   cvd_cumulative_5   = sum(delta[-6:-1]) / atr5_val  (5-bar rolling sum)
+    #   cvd_cumulative_20  = sum(delta[-21:-1]) / atr5_val (20-bar rolling sum)
+    #   cvd_trend_slope    = OLS slope of delta[-11:-1] / atr5_val (10-bar window)
+    #   cvd_divergence     = +1 disagree / -1 agree / 0 flat (price vs CVD dir, 5 bars)
+    #   oi_change_5bar     = (oi[-2] - oi[-7]) / |oi[-7]|  (pct change over 5 bars)
     #
     # We look up the last CVD candle whose timestamp <= ts_n1_live (N-1 bar).
-    # This is identical to the merge_asof backward join used in training.
+    # The slice ending at that index provides the rolling history — identical
+    # to the merge_asof backward join + rolling computation used in training.
+    #
+    # Parity guarantee: both paths use bars ending at N-1 (inclusive) and look
+    # back into history. Neither path reads the forming candle (N).
     # -----------------------------------------------------------------------
     cvd_live_available = (
         cvd_live is not None
@@ -814,6 +960,15 @@ def build_live_features(
         and "short_taker_size" in cvd_live.columns
     )
 
+    # neutral defaults — used on any failure path
+    cvd_ratio_live         = 0.5
+    cvd_delta_norm_live    = 0.0
+    cvd_cumulative_5_live  = 0.0
+    cvd_cumulative_20_live = 0.0
+    cvd_trend_slope_live   = 0.0
+    cvd_divergence_live    = 0.0
+    oi_change_5bar_live    = 0.0
+
     if cvd_live_available:
         # ts_n1_for_cvd: N-1 timestamp. df5[-1] is forming candle N, df5[-2] is N-1.
         ts_n1_for_cvd = df5["timestamp"].iloc[-2] if len(df5) >= 2 else None
@@ -821,30 +976,88 @@ def build_live_features(
             _cvd_ts = pd.to_datetime(cvd_live["timestamp"], utc=True).astype("datetime64[ms, UTC]")
             _mask_cvd = _cvd_ts <= pd.Timestamp(ts_n1_for_cvd)
             if _mask_cvd.any():
-                _cvd_row = cvd_live[_mask_cvd].iloc[-1]
+                # Full slice of CVD bars up to and including N-1
+                _cvd_slice = cvd_live[_mask_cvd].reset_index(drop=True)
+                _cvd_row = _cvd_slice.iloc[-1]
+
+                # --- cvd_ratio and cvd_delta_norm (single bar N-1) ---
                 _lts = float(_cvd_row.get("long_taker_size", 0) or 0)
                 _sts = float(_cvd_row.get("short_taker_size", 0) or 0)
                 _total = max(_lts + _sts, 1e-9)
                 cvd_ratio_live = float(np.clip(_lts / _total, 0.0, 1.0))
-                _delta = _lts - _sts
-                cvd_delta_norm_live = float(_delta / max(atr5_val, 1e-9))
+                _delta_n1 = _lts - _sts
+                cvd_delta_norm_live = float(_delta_n1 / max(atr5_val, 1e-9))
+
+                # --- rolling delta series (all bars up to N-1 inclusive) ---
+                _lts_arr = _cvd_slice["long_taker_size"].astype(float).values
+                _sts_arr = _cvd_slice["short_taker_size"].astype(float).values
+                _delta_arr = _lts_arr - _sts_arr  # shape (K,), K = bars up to N-1
+
+                # cvd_cumulative_5: sum of last 5 bars of delta (bars N-5..N-1)
+                # Equivalent to training: rolling(5).sum().shift(1) merged at N-1
+                # means the value AT N-1 position is sum of [N-5 .. N-1] bars.
+                if len(_delta_arr) >= 2:
+                    _slice5  = _delta_arr[max(0, len(_delta_arr) - 5):]
+                    _slice20 = _delta_arr[max(0, len(_delta_arr) - 20):]
+                    cvd_cumulative_5_live  = float(np.sum(_slice5)  / max(atr5_val, 1e-9))
+                    cvd_cumulative_20_live = float(np.sum(_slice20) / max(atr5_val, 1e-9))
+                else:
+                    cvd_cumulative_5_live  = 0.0
+                    cvd_cumulative_20_live = 0.0
+
+                # cvd_trend_slope: OLS slope over last 10 bars of delta
+                if len(_delta_arr) >= 3:
+                    _slope_vals = _delta_arr[max(0, len(_delta_arr) - 10):]
+                    _v = _slope_vals[~np.isnan(_slope_vals)]
+                    if len(_v) >= 3:
+                        _x = np.arange(len(_v), dtype=np.float64)
+                        try:
+                            _slope = float(np.polyfit(_x, _v, 1)[0])
+                        except Exception:
+                            _slope = 0.0
+                        cvd_trend_slope_live = float(_slope / max(atr5_val, 1e-9))
+                    else:
+                        cvd_trend_slope_live = 0.0
+                else:
+                    cvd_trend_slope_live = 0.0
+
+                # cvd_divergence: sign disagreement between price dir and CVD dir
+                # price direction: sign of sum(close-open) over last 5 5m candles ending at N-1
+                # df5[-1] is forming N, df5[-2] is N-1, so last 5 completed = df5[-6:-1]
+                if len(df5) >= 6:
+                    _price_bodies = (df5["close"].iloc[-6:-1] - df5["open"].iloc[-6:-1]).values
+                    _price_dir = np.sign(float(np.sum(_price_bodies)))
+                else:
+                    _price_dir = 0.0
+                _cvd_dir_5 = np.sign(float(np.sum(_delta_arr[max(0, len(_delta_arr) - 5):])))
+                if _price_dir == 0.0 or _cvd_dir_5 == 0.0:
+                    cvd_divergence_live = 0.0
+                elif _price_dir != _cvd_dir_5:
+                    cvd_divergence_live = 1.0   # diverging
+                else:
+                    cvd_divergence_live = -1.0  # aligning
+
+                # oi_change_5bar: (oi[N-1] - oi[N-6]) / |oi[N-6]|
+                if "open_interest" in _cvd_slice.columns and len(_cvd_slice) >= 6:
+                    _oi_arr = _cvd_slice["open_interest"].astype(float).values
+                    _oi_n1  = _oi_arr[-1]
+                    _oi_n6  = _oi_arr[-6]
+                    _oi_denom = max(abs(_oi_n6), 1e-9)
+                    oi_change_5bar_live = float((_oi_n1 - _oi_n6) / _oi_denom)
+                else:
+                    oi_change_5bar_live = 0.0
+
             else:
                 log.debug(
                     "build_live_features: no CVD candle at or before ts_n1=%s — using neutrals",
                     ts_n1_for_cvd,
                 )
-                cvd_ratio_live = 0.5
-                cvd_delta_norm_live = 0.0
-        else:
-            cvd_ratio_live = 0.5
-            cvd_delta_norm_live = 0.0
+        # else: ts_n1_for_cvd is None/NaT — neutrals already set above
     else:
         log.debug(
             "build_live_features: cvd_live not provided or empty — "
-            "using neutral defaults (cvd_ratio=0.5, cvd_delta_norm=0.0)"
+            "using neutral defaults for all CVD/OI features"
         )
-        cvd_ratio_live = 0.5
-        cvd_delta_norm_live = 0.0
 
     row = np.array([[
         body_ratio_n1, body_ratio_n2, body_ratio_n3,
@@ -860,6 +1073,8 @@ def build_live_features(
         rsi14, candle_streak, price_in_range, ema_cross_5m,
         body_vs_range5, range_expansion, vwap_dist_20,
         cvd_ratio_live, cvd_delta_norm_live,
+        cvd_cumulative_5_live, cvd_cumulative_20_live, cvd_trend_slope_live,
+        cvd_divergence_live, oi_change_5bar_live,
     ]], dtype=np.float64)
 
     nan_features = [FEATURE_COLS[i] for i in range(len(FEATURE_COLS)) if np.isnan(row[0][i])]

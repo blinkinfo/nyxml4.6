@@ -529,8 +529,9 @@ def fetch_gate_cvd(start_ms: int, end_ms: int) -> pd.DataFrame:
     """Fetch BTC/USDT 5m taker buy/sell volume from Gate.io contract_stats.
 
     Gate.io /futures/usdt/contract_stats returns per-candle aggregate stats
-    including long_taker_size (aggressive buy volume) and short_taker_size
-    (aggressive sell volume) — real exchange-reported taker flow, no estimation.
+    including long_taker_size (aggressive buy volume), short_taker_size
+    (aggressive sell volume), and open_interest — real exchange-reported taker
+    flow and position data, no estimation.
 
     Gate timestamps are in SECONDS; we convert to ms for alignment with MEXC.
     Paginates forward from start_ms to end_ms in chunks of _GATE_MAX_LIMIT candles.
@@ -544,10 +545,11 @@ def fetch_gate_cvd(start_ms: int, end_ms: int) -> pd.DataFrame:
             timestamp         (datetime64[ms, UTC]) — 5m bucket open time
             long_taker_size   (float) — aggressive buy volume (contracts)
             short_taker_size  (float) — aggressive sell volume (contracts)
+            open_interest     (float) — open interest in contracts
         Sorted ascending by timestamp, deduplicated, filtered to [start_ms, end_ms).
         Returns empty DataFrame with correct columns on any hard failure.
     """
-    _EMPTY = pd.DataFrame(columns=["timestamp", "long_taker_size", "short_taker_size"])
+    _EMPTY = pd.DataFrame(columns=["timestamp", "long_taker_size", "short_taker_size", "open_interest"])
 
     # Gate uses seconds; convert ms → s for params
     start_sec = start_ms // 1000
@@ -593,11 +595,13 @@ def fetch_gate_cvd(start_ms: int, end_ms: int) -> pd.DataFrame:
                     ts_sec = int(row["time"])
                     lts = float(row.get("long_taker_size", 0) or 0)
                     sts = float(row.get("short_taker_size", 0) or 0)
+                    oi  = float(row.get("open_interest", 0) or 0)
                     records.append({
                         # Convert Gate seconds → ms for parity with all other DFs
                         "timestamp": pd.Timestamp(ts_sec * 1000, unit="ms", tz="UTC"),
                         "long_taker_size": lts,
                         "short_taker_size": sts,
+                        "open_interest": oi,
                     })
                 except (KeyError, TypeError, ValueError) as exc:
                     log.debug("fetch_gate_cvd: skipping malformed row: %s — %s", row, exc)
@@ -647,7 +651,7 @@ def fetch_live_gate_cvd(limit: int = 400) -> pd.DataFrame:
         DataFrame with columns: timestamp, long_taker_size, short_taker_size
         Sorted ascending. Returns empty DataFrame on failure.
     """
-    _EMPTY = pd.DataFrame(columns=["timestamp", "long_taker_size", "short_taker_size"])
+    _EMPTY = pd.DataFrame(columns=["timestamp", "long_taker_size", "short_taker_size", "open_interest"])
 
     params = {
         "contract": _GATE_CONTRACT,
@@ -675,10 +679,12 @@ def fetch_live_gate_cvd(limit: int = 400) -> pd.DataFrame:
             ts_sec = int(row["time"])
             lts = float(row.get("long_taker_size", 0) or 0)
             sts = float(row.get("short_taker_size", 0) or 0)
+            oi  = float(row.get("open_interest", 0) or 0)
             records.append({
                 "timestamp": pd.Timestamp(ts_sec * 1000, unit="ms", tz="UTC"),
                 "long_taker_size": lts,
                 "short_taker_size": sts,
+                "open_interest": oi,
             })
         except (KeyError, TypeError, ValueError) as exc:
             log.debug("fetch_live_gate_cvd: skipping malformed row: %s — %s", row, exc)
