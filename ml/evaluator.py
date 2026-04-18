@@ -13,8 +13,34 @@ from sklearn.metrics import (
 )
 
 from config import ML_PAYOUT_RATIO
+from ml.probability import apply_probability_calibration, compute_probability_diagnostics
 
 log = logging.getLogger(__name__)
+
+
+def _probability_quality_outcome(raw_diag: dict, used_diag: dict) -> tuple[str, float, float]:
+    delta_brier = float(used_diag.get("brier_score", 0.0)) - float(raw_diag.get("brier_score", 0.0))
+    delta_ece = float(used_diag.get("ece", 0.0)) - float(raw_diag.get("ece", 0.0))
+    if delta_brier < -1e-6 or delta_ece < -1e-6:
+        outcome = "improved"
+    elif abs(delta_brier) <= 1e-6 and abs(delta_ece) <= 1e-6:
+        outcome = "neutral"
+    else:
+        outcome = "mixed"
+    return outcome, delta_brier, delta_ece
+
+
+def _bucket_preview(diagnostics: dict | None) -> str:
+    if not isinstance(diagnostics, dict):
+        return "na"
+    buckets = diagnostics.get("buckets") or []
+    if not buckets:
+        return "none"
+    parts = []
+    for idx in sorted({0, len(buckets) // 2, len(buckets) - 1}):
+        bucket = buckets[idx]
+        parts.append(f"b{bucket.get('bucket')}:{bucket.get('prob_mean', 0.0):.3f}->{bucket.get('win_rate', 0.0):.3f}")
+    return ",".join(parts)
 
 
 def evaluate(
@@ -24,6 +50,7 @@ def evaluate(
     threshold: float,
     test_period_days: float = 37,
     payout: float = ML_PAYOUT_RATIO,
+    probability_metadata: dict | None = None,
 ) -> dict:
     """Full evaluation of a trained LightGBM model on a hold-out test set.
 
@@ -44,7 +71,25 @@ def evaluate(
                    ev_per_trade, ev_per_day, brier_score, calibration_mean,
                    confusion_matrix, threshold, payout
     """
-    probs = model.predict(X_test)
+    raw_probs = model.predict(X_test)
+    probs, calibration_applied, calibration_method = apply_probability_calibration(raw_probs, probability_metadata)
+    raw_diag = compute_probability_diagnostics(raw_probs, y_test, "test_raw")
+    used_diag = compute_probability_diagnostics(probs, y_test, "test_used")
+    quality_outcome, delta_brier, delta_ece = _probability_quality_outcome(raw_diag, used_diag)
+    log.info(
+        "evaluate: probability_quality calibration_applied=%s method=%s outcome=%s delta_brier=%+.4f delta_ece=%+.4f raw[brier=%.4f ece=%.4f buckets=%s] used[brier=%.4f ece=%.4f buckets=%s]",
+        calibration_applied,
+        calibration_method,
+        quality_outcome,
+        delta_brier,
+        delta_ece,
+        raw_diag.get("brier_score", 0.0),
+        raw_diag.get("ece", 0.0),
+        _bucket_preview(raw_diag),
+        used_diag.get("brier_score", 0.0),
+        used_diag.get("ece", 0.0),
+        _bucket_preview(used_diag),
+    )
     mask = probs >= threshold
     trades = int(mask.sum())
 
@@ -63,6 +108,13 @@ def evaluate(
             "confusion_matrix": [[0, 0], [0, 0]],
             "threshold": threshold,
             "payout": payout,
+            "raw_brier_score": float(np.mean((raw_probs - y_test) ** 2)),
+            "calibration_applied": calibration_applied,
+            "calibration_method": calibration_method,
+            "probability_diagnostics": {
+                "raw": raw_diag,
+                "used": used_diag,
+            },
         }
         _print_table(result)
         return result
@@ -102,6 +154,13 @@ def evaluate(
         "confusion_matrix": cm,
         "threshold": threshold,
         "payout": payout,
+        "raw_brier_score": float(np.mean((raw_probs - y_test) ** 2)),
+        "calibration_applied": calibration_applied,
+        "calibration_method": calibration_method,
+        "probability_diagnostics": {
+            "raw": raw_diag,
+            "used": used_diag,
+        },
     }
 
     _print_table(result)
@@ -151,42 +210,18 @@ def compute_risk_metrics(
     if trades == 0:
         return _zero
 
-    # Ordered W/L outcomes — time order preserved (no shuffling)
-    outcomes = y_true[mask].astype(int)  # 1 = win, 0 = loss
-
-    # Per-trade P&L: win -> +payout, loss -> -1.0
+    outcomes = y_true[mask].astype(int)
     pnl = np.where(outcomes == 1, payout, -1.0)
 
-    # -----------------------------------------------------------------------
-    # Max drawdown — peak-to-trough on cumulative equity curve
-    # Starting equity = 0 (relative, $1 flat-bet each trade)
-    # -----------------------------------------------------------------------
-    equity = np.concatenate([[0.0], np.cumsum(pnl)])   # shape (trades+1,)
+    equity = np.concatenate([[0.0], np.cumsum(pnl)])
     peak = np.maximum.accumulate(equity)
-    drawdown = equity - peak                            # always <= 0
-    max_dd_dollar = float(np.min(drawdown))            # most negative value
+    drawdown = equity - peak
+    max_dd_dollar = float(np.min(drawdown))
 
-    # Percentage drawdown: drawdown / peak — guard against peak == 0.
-    #
-    # Design choice: when the running peak is 0 (i.e. equity has never risen
-    # above the starting value of 0), we define the percentage drawdown as 0.0
-    # at that point rather than divide-by-zero.  This arises in two cases:
-    #   1. The very first trade(s) are losses — peak stays at 0.0 while equity
-    #      goes negative, so there is no positive capital base to express the
-    #      drawdown against.
-    #   2. An all-losing sequence — peak never exceeds 0.0 throughout.
-    #
-    # Consequence: on sequences that open with losses, max_dd_pct will be
-    # 0.0% even though max_dd_dollar is negative.  The dollar figure is the
-    # authoritative risk measure in that scenario; the percentage figure is
-    # intentionally suppressed to avoid a misleading division artefact.
     with np.errstate(invalid="ignore", divide="ignore"):
         dd_pct = np.where(peak > 0, drawdown / peak * 100.0, 0.0)
-    max_dd_pct = float(np.min(dd_pct))                 # most negative %
+    max_dd_pct = float(np.min(dd_pct))
 
-    # -----------------------------------------------------------------------
-    # Win / loss streaks
-    # -----------------------------------------------------------------------
     max_win_streak = 0
     max_loss_streak = 0
     cur_win = 0
@@ -203,31 +238,19 @@ def compute_risk_metrics(
             if cur_loss > max_loss_streak:
                 max_loss_streak = cur_loss
 
-    # -----------------------------------------------------------------------
-    # Profit factor — gross_wins / gross_losses
-    # -----------------------------------------------------------------------
-    gross_wins   = float(np.sum(pnl[pnl > 0]))
+    gross_wins = float(np.sum(pnl[pnl > 0]))
     gross_losses = float(np.abs(np.sum(pnl[pnl < 0])))
     if gross_losses == 0.0:
         profit_factor = float("inf") if gross_wins > 0 else 0.0
     else:
         profit_factor = round(gross_wins / gross_losses, 4)
 
-    # -----------------------------------------------------------------------
-    # Sharpe ratio — annualised, assuming ~288 5-min slots/day on this sample
-    # We use per-trade returns (pnl) and scale to daily assuming trades_per_day.
-    # Formula: (mean_pnl / std_pnl) * sqrt(trades) is the per-sample Sharpe.
-    # We annualise by scaling to 252 trading days, so we need trades_per_day.
-    # Approximation: trades / (len(probs) * 5 / 1440) gives trades_per_day.
-    # -----------------------------------------------------------------------
     sharpe = 0.0
     if trades >= 2:
         mean_r = float(np.mean(pnl))
-        std_r  = float(np.std(pnl, ddof=1))
+        std_r = float(np.std(pnl, ddof=1))
         if std_r > 0:
-            # trades_per_day from this sample window
             tpd = trades / max(len(probs) * 5 / 1440, 1e-9)
-            # Annualise: multiply by sqrt(252 * trades_per_day)
             sharpe = round((mean_r / std_r) * (252 * tpd) ** 0.5, 4)
 
     return {
@@ -395,20 +418,26 @@ def check_feature_drift(
                     "z_score": round(z, 3),
                 })
                 log.warning(
-                    "check_feature_drift: DRIFT DETECTED feature=%s live_mean=%.4f "
-                    "train_mean=%.4f train_std=%.4f z=%.2f",
-                    fname, live_mean, train_mean, train_std, z,
+                    "check_feature_drift: DRIFT DETECTED feature=%s live_mean=%.4f train_mean=%.4f train_std=%.4f z=%.2f",
+                    fname,
+                    live_mean,
+                    train_mean,
+                    train_std,
+                    z,
                 )
 
         if not drifted:
             log.info(
                 "check_feature_drift: no drift detected (%d records, %d features checked)",
-                n, len(training_feature_stats),
+                n,
+                len(training_feature_stats),
             )
         else:
             log.warning(
                 "check_feature_drift: %d feature(s) drifted beyond %.1f sigma: %s",
-                len(drifted), z_threshold, [d["feature"] for d in drifted],
+                len(drifted),
+                z_threshold,
+                [d["feature"] for d in drifted],
             )
 
         return {

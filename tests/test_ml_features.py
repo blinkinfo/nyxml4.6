@@ -687,3 +687,36 @@ def test_cvd_delta_norm_parity():
     # Training and live must match
     np.testing.assert_allclose(live_val, train_val, atol=1e-9,
         err_msg=f"cvd_delta_norm mismatch: train={train_val} live={live_val}")
+
+
+
+def test_sample_quality_weights_are_bounded():
+    import numpy as np
+    from ml.probability import derive_sample_weights
+
+    feature_names = ["body_ratio", "vol_regime", "funding_zscore"]
+    X = np.array([
+        [0.01, -3.0, -3.0],
+        [0.02, 0.0, 0.0],
+        [0.50, 1.0, 1.0],
+        [0.80, 3.5, 3.5],
+    ] * 20, dtype=float)
+    y = np.array(([0, 1, 1, 0] * 20), dtype=int)
+    result = derive_sample_weights(X, y, feature_names, {"enabled": True})
+    weights = result["weights"]
+    assert weights.shape[0] == X.shape[0]
+    assert float(weights.min()) >= 0.25
+    assert float(weights.max()) <= 1.0
+    assert result["summary"]["enabled"] is True
+
+
+def test_probability_diagnostics_compact_buckets():
+    import numpy as np
+    from ml.probability import compute_probability_diagnostics
+
+    probs = np.linspace(0.05, 0.95, 100)
+    y = (probs > 0.5).astype(int)
+    diag = compute_probability_diagnostics(probs, y, "demo", bucket_count=5)
+    assert diag["label"] == "demo"
+    assert len(diag["buckets"]) == 5
+    assert diag["sample_count"] == 100

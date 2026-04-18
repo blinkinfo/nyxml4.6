@@ -77,3 +77,54 @@ def test_ml_strategy_registered():
     from core.strategies import get_strategy
     s = get_strategy('ml')
     assert s is not None
+
+
+
+def test_probability_calibration_helper_round_trip():
+    import numpy as np
+    from ml.probability import fit_probability_calibrator, apply_probability_calibration
+
+    raw = np.linspace(0.05, 0.95, 120)
+    y = (raw > 0.6).astype(int)
+    meta = fit_probability_calibrator(raw, y)
+    assert meta is not None
+    cal, applied, method = apply_probability_calibration(raw, {"probability_calibration": meta})
+    assert applied is True
+    assert method in {"isotonic", "platt"}
+    assert cal.shape == raw.shape
+    assert np.all(cal > 0)
+    assert np.all(cal < 1)
+
+
+def test_probability_calibration_fails_open_for_missing_metadata():
+    import numpy as np
+    from ml.probability import apply_probability_calibration
+
+    raw = np.array([0.2, 0.8])
+    cal, applied, method = apply_probability_calibration(raw, None)
+    assert applied is False
+    assert method is None
+    assert np.allclose(cal, raw)
+
+
+def test_live_trust_report_fails_open_for_bad_metadata():
+    import numpy as np
+    from ml.probability import build_live_trust_report
+
+    row = np.array([[0.0, 0.0]])
+    report = build_live_trust_report(row, ["a", "b"], {"training_feature_stats": "bad"})
+    assert report["ok"] is True
+
+
+def test_live_trust_report_detects_feature_breach():
+    import numpy as np
+    from ml.probability import build_live_trust_report
+
+    row = np.array([[5.0]])
+    meta = {
+        "training_feature_stats": {"vol_regime": {"mean": 0.0, "std": 1.0}},
+        "live_trust_gate": {"enabled": True, "monitored_features": ["vol_regime"], "zscore_limit": 2.0, "max_feature_breaches": 0},
+    }
+    report = build_live_trust_report(row, ["vol_regime"], meta)
+    assert report["ok"] is False
+    assert report["reasons"]

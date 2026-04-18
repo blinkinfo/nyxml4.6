@@ -18,6 +18,7 @@ from ml import data_fetcher
 from ml import features as feat_eng
 from ml import model_store
 from ml import inference_logger
+from ml.probability import apply_probability_calibration, build_live_trust_report
 from db import queries
 from polymarket.markets import get_next_slot_info, get_slot_prices
 import config as cfg
@@ -25,6 +26,22 @@ import config as cfg
 log = logging.getLogger(__name__)
 
 FEATURE_COLS = feat_eng.FEATURE_COLS  # 42 features in exact order
+
+
+def _trust_reason_summary(reasons: list[str] | None) -> str:
+    if not reasons:
+        return "none"
+    return ";".join(reasons[:3])
+
+
+def _calibration_metadata_status(metadata: dict[str, Any] | None) -> tuple[bool, str | None]:
+    if not isinstance(metadata, dict):
+        return False, None
+    calibration = metadata.get("probability_calibration")
+    if not isinstance(calibration, dict):
+        return False, None
+    method = calibration.get("method")
+    return True, method if isinstance(method, str) else None
 
 # Module-level reload flag so cmd_promote_model can signal a reload
 _RELOAD_REQUESTED = False
@@ -337,13 +354,33 @@ class MLStrategy(BaseStrategy):
                 )
                 return {**base_fields, "reason": "Insufficient data for features"}
 
+            metadata = model_store.load_metadata(self._model_slot) or {}
+            calibration_metadata_present, calibration_metadata_method = _calibration_metadata_status(metadata)
+
             # Model inference — P(UP) as a single float in [0, 1]
-            prob = float(self._model.predict(feature_row)[0])
+            raw_prob = float(self._model.predict(feature_row)[0])
+            calibrated_probs, calibration_applied, calibration_method = apply_probability_calibration([raw_prob], metadata)
+            prob = float(calibrated_probs[0])
             up_threshold   = await self._get_threshold()
             down_threshold = await self._get_down_threshold(up_threshold)
 
             # P(DOWN) = 1 - P(UP)
             prob_down = round(1.0 - prob, 6)
+
+            trust_report = build_live_trust_report(feature_row, FEATURE_COLS, metadata)
+            trust_ok = bool(trust_report.get("ok", True))
+            trust_reasons = trust_report.get("reasons", [])
+            trust_failed_open = bool((trust_report.get("details") or {}).get("failed_open"))
+            if trust_failed_open:
+                log.warning(
+                    "MLStrategy: live trust gate failed open slot=%s reason=%s",
+                    slug, (trust_report.get("details") or {}).get("failed_open"),
+                )
+            log.info(
+                "MLStrategy: probability_path slot=%s raw=%.4f calibrated=%.4f calibration_applied=%s calibration_metadata_present=%s metadata_method=%s method_used=%s trust_ok=%s trust_reason=%s",
+                slug, raw_prob, prob, calibration_applied, calibration_metadata_present,
+                calibration_metadata_method, calibration_method, trust_ok, _trust_reason_summary(trust_reasons),
+            )
 
             up_qualifies = prob >= up_threshold
 
@@ -378,7 +415,7 @@ class MLStrategy(BaseStrategy):
             #     never crashes inference -- the model fires normally if gate errors.
             # ------------------------------------------------------------------
             try:
-                _meta = model_store.load_metadata(self._model_slot)
+                _meta = metadata
                 if _meta is not None:
                     _regime_p5  = _meta.get("regime_vol_p5")
                     _regime_p95 = _meta.get("regime_vol_p95")
@@ -421,18 +458,66 @@ class MLStrategy(BaseStrategy):
                                 **base_fields,
                                 "pattern": f"p={prob:.4f} [regime_gate]",
                                 "reason": _regime_skip_reason,
-                                "ml_p_up":           prob,
-                                "ml_p_down":         prob_down,
-                                "ml_up_threshold":   up_threshold,
+                                "ml_p_up": prob,
+                                "ml_p_up_raw": raw_prob,
+                                "ml_probability_calibrated": calibration_applied,
+                                "ml_probability_calibration_method": calibration_method,
+                                "ml_p_down": prob_down,
+                                "ml_up_threshold": up_threshold,
                                 "ml_down_threshold": down_threshold,
-                                "ml_down_enabled":   down_enabled,
+                                "ml_down_enabled": down_enabled,
                             }
             except Exception as _rge:
                 # Never let the regime gate itself crash inference.
                 # Log and continue -- the model fires normally if the gate errors.
                 log.warning(
-                    "MLStrategy: regime gate check failed (non-fatal, continuing): %s", _rge
+                    "MLStrategy: regime gate check failed open slot=%s reason=%s", slug, _rge
                 )
+
+            if not trust_report.get("ok", True):
+                trust_reason = "Trust gate: " + "; ".join(trust_report.get("reasons", []))
+                log.warning(
+                    "MLStrategy: trust gate blocked slot=%s raw=%.4f calibrated=%.4f method=%s reason=%s",
+                    slug, raw_prob, prob, calibration_method, _trust_reason_summary(trust_report.get("reasons", [])),
+                )
+                inference_logger.log_inference(
+                    slot_slug=slug,
+                    slot_ts=slot_ts,
+                    slot_start_str=slot_start_str,
+                    slot_end_str=slot_end_str,
+                    df5_rows=df5_rows,
+                    df15_rows=df15_rows,
+                    df1h_rows=df1h_rows,
+                    cvd_rows=cvd_rows,
+                    funding_buf_len=funding_buf_len,
+                    candle_n1_ts=candle_n1_ts,
+                    candle_n1_close=candle_n1_close,
+                    candle_n1_vol=candle_n1_vol,
+                    feature_names=FEATURE_COLS,
+                    feature_row=feature_row,
+                    nan_features=[],
+                    p_up=prob,
+                    p_down=prob_down,
+                    up_threshold=up_threshold,
+                    down_threshold=down_threshold,
+                    down_enabled=down_enabled,
+                    fired=False,
+                    side=None,
+                    skip_reason=trust_reason,
+                )
+                return {
+                    **base_fields,
+                    "pattern": f"p={prob:.4f} [trust_gate]",
+                    "reason": trust_reason,
+                    "ml_p_up": prob,
+                    "ml_p_up_raw": raw_prob,
+                    "ml_probability_calibrated": calibration_applied,
+                    "ml_probability_calibration_method": calibration_method,
+                    "ml_p_down": prob_down,
+                    "ml_up_threshold": up_threshold,
+                    "ml_down_threshold": down_threshold,
+                    "ml_down_enabled": down_enabled,
+                }
 
             down_qualifies = down_enabled and (prob_down >= down_threshold)
 
@@ -495,6 +580,9 @@ class MLStrategy(BaseStrategy):
                     "reason": skip_reason,
                     # Structured ML fields for rich Telegram formatting
                     "ml_p_up": prob,
+                    "ml_p_up_raw": raw_prob,
+                    "ml_probability_calibrated": calibration_applied,
+                    "ml_probability_calibration_method": calibration_method,
                     "ml_p_down": prob_down,
                     "ml_up_threshold": up_threshold,
                     "ml_down_threshold": down_threshold,
@@ -502,10 +590,9 @@ class MLStrategy(BaseStrategy):
                 }
 
             log.info(
-                "MLStrategy: side=%s p_up=%.4f p_down=%.4f up_thr=%.3f down_thr=%.3f "
-                "down_enabled=%s slot=%s",
-                side, prob, prob_down, up_threshold, down_threshold,
-                down_enabled, slug,
+                "MLStrategy: inference_decision slot=%s side=%s raw=%.4f calibrated=%.4f p_down=%.4f up_thr=%.3f down_thr=%.3f down_enabled=%s calibration_applied=%s method=%s trust_ok=%s",
+                slug, side, raw_prob, prob, prob_down, up_threshold, down_threshold,
+                down_enabled, calibration_applied, calibration_method, trust_ok,
             )
 
             # Fetch Polymarket prices — identical to PatternStrategy
@@ -547,6 +634,9 @@ class MLStrategy(BaseStrategy):
                     # the scheduler can render the rich ML skip card instead of
                     # falling back to the generic format_skip() card.
                     "ml_p_up":           prob,
+                    "ml_p_up_raw":       raw_prob,
+                    "ml_probability_calibrated": calibration_applied,
+                    "ml_probability_calibration_method": calibration_method,
                     "ml_p_down":         prob_down,
                     "ml_up_threshold":   up_threshold,
                     "ml_down_threshold": down_threshold,
@@ -593,9 +683,12 @@ class MLStrategy(BaseStrategy):
                 "opposite_price":    opposite_price,
                 "token_id":          token_id,
                 "opposite_token_id": opposite_token_id,
-                "pattern":        f"p_up={prob:.4f},p_down={prob_down:.4f}",
+                "pattern":        f"p_up={prob:.4f},p_down={prob_down:.4f}" + (f",raw={raw_prob:.4f}" if calibration_applied else ""),
                 # Structured ML fields for rich Telegram formatting
                 "ml_p_up":          prob,
+                "ml_p_up_raw":      raw_prob,
+                "ml_probability_calibrated": calibration_applied,
+                "ml_probability_calibration_method": calibration_method,
                 "ml_p_down":        prob_down,
                 "ml_up_threshold":  up_threshold,
                 "ml_down_threshold": down_threshold,
