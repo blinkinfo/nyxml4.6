@@ -1198,7 +1198,7 @@ async def _retrain_background(application, chat_id) -> None:
 
     try:
         loop = _asyncio.get_event_loop()
-        log.info("Retrain: fetching 9 months of MEXC data...")
+        log.info("Retrain: fetching 9 months of training inputs...")
         data = await _asyncio.wait_for(
             loop.run_in_executor(None, lambda: data_fetcher.fetch_all(months=9)),
             timeout=1500,

@@ -5,7 +5,7 @@ sys.path.insert(0, site.getusersitepackages())
 sys.path.insert(0, '/home/nebula/nyxml4')
 from ml import data_fetcher, features as feat_eng, trainer, model_store
 
-print('Fetching 9 months of MEXC data...')
+print('Fetching 9 months of training data...')
 data = data_fetcher.fetch_all(months=9)
 print(f'5m: {len(data["df5"])}, 15m: {len(data["df15"])}, 1h: {len(data["df1h"])}, cvd: {len(data["cvd"])}')
 

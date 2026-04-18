@@ -172,7 +172,7 @@ def test_live_features_match_training_for_latest_closed_5m_row():
       - 15m/1h context is selected by timestamp <= ts_n1, not by blindly
         dropping the latest higher-timeframe row.
 
-    This test builds synthetic aligned 5m/15m/1h/funding data, then checks
+    This test builds synthetic aligned 5m/15m/1h data, then checks
     that build_live_features(...) equals the corresponding row from
     build_features(...), feature-by-feature.
     """
@@ -234,161 +234,28 @@ def test_live_features_match_training_for_latest_closed_5m_row():
 
 
 
-def test_fetch_funding_mock():
-    """Verify fetch_funding() behaviour using mocked ccxt and MEXC REST API.
+def test_fetch_all_returns_active_training_inputs_only():
+    """fetch_all should return only the active no-funding training inputs."""
+    from unittest.mock import patch
+    from ml.data_fetcher import fetch_all
 
-    Scenarios tested:
-      (a) ccxt pagination stalls with no forward progress -> stops ccxt loop
-      (b) ccxt coverage is sparse -> falls back to MEXC REST API
-      (c) REST results are deduplicated (duplicate settleTime entries collapsed)
-      (d) Records outside [start_ms, end_ms) are filtered out
-    """
-    import sys
-    sys.path.insert(0, '/home/nebula/nyxml4')
+    fake_df5 = pd.DataFrame({"timestamp": pd.to_datetime(["2026-01-01T00:00:00Z"]), "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0]})
+    fake_df15 = fake_df5.copy()
+    fake_df1h = fake_df5.copy()
+    fake_cvd = pd.DataFrame({"timestamp": pd.to_datetime(["2026-01-01T00:00:00Z"]), "long_taker_size": [1.0], "short_taker_size": [1.0], "open_interest": [1.0]})
 
-    from unittest.mock import patch, MagicMock
-    import ml.data_fetcher as df_module
-    from ml.data_fetcher import fetch_funding
+    with patch("ml.data_fetcher.fetch_5m", return_value=fake_df5), \
+         patch("ml.data_fetcher.fetch_15m", return_value=fake_df15), \
+         patch("ml.data_fetcher.fetch_1h", return_value=fake_df1h), \
+         patch("ml.data_fetcher.fetch_gate_cvd", return_value=fake_cvd):
+        result = fetch_all(months=1)
 
-    now_ms = 1_700_000_000_000
-    start_ms = now_ms - 10 * 24 * 3600 * 1000
-    end_ms   = now_ms
-
-    ccxt_ts_1 = end_ms - 3 * 8 * 3600 * 1000
-    ccxt_ts_2 = end_ms - 2 * 8 * 3600 * 1000
-    ccxt_ts_3 = end_ms - 1 * 8 * 3600 * 1000
-    ccxt_page1 = [
-        {"timestamp": ccxt_ts_3, "fundingRate": 0.0003},
-        {"timestamp": ccxt_ts_2, "fundingRate": 0.0002},
-        {"timestamp": ccxt_ts_1, "fundingRate": 0.0001},
-    ]
-    ccxt_page2 = [
-        {"timestamp": ccxt_ts_3, "fundingRate": 0.0003},
-    ]
-
-    mock_exchange = MagicMock()
-    mock_exchange.fetch_funding_rate_history.side_effect = [ccxt_page1, ccxt_page2]
-
-    interval_ms = 8 * 3600 * 1000
-
-    def make_rest_items(ts_list):
-        return [{"settleTime": str(ts), "fundingRate": str(round(0.0001 * (i + 1), 6))}
-                for i, ts in enumerate(ts_list)]
-
-    rest_page1_ts = [end_ms - i * interval_ms for i in range(1, 6)]
-    rest_page1_items = make_rest_items(rest_page1_ts)
-
-    rest_page2_ts = [end_ms - i * interval_ms for i in range(5, 11)]
-    rest_page2_ts.append(start_ms - interval_ms)
-    rest_page2_ts.append(rest_page1_ts[-1])
-    rest_page2_items = make_rest_items(rest_page2_ts)
-
-    rest_page3_items: list = []
-
-    def mock_httpx_get(url, params=None, **kwargs):
-        page = int((params or {}).get("page_num", 1))
-        if page == 1:
-            items = rest_page1_items
-        elif page == 2:
-            items = rest_page2_items
-        else:
-            items = rest_page3_items
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"data": {"resultList": items}}
-        mock_resp.raise_for_status.return_value = None
-        return mock_resp
-
-    with patch.object(df_module.ccxt, "mexc", return_value=mock_exchange), \
-         patch("ml.data_fetcher.httpx.Client") as mock_client_cls, \
-         patch("ml.data_fetcher.time.sleep"):
-
-        mock_client_instance = MagicMock()
-        mock_client_instance.__enter__ = MagicMock(return_value=mock_client_instance)
-        mock_client_instance.__exit__ = MagicMock(return_value=False)
-        mock_client_instance.get.side_effect = mock_httpx_get
-        mock_client_cls.return_value = mock_client_instance
-
-        result = fetch_funding(start_ms, end_ms)
-
-    assert mock_exchange.fetch_funding_rate_history.call_count == 2, (
-        f"Expected 2 ccxt calls (page1 + no-progress page2), got {mock_exchange.fetch_funding_rate_history.call_count}"
-    )
-    assert mock_client_instance.get.call_count >= 2, (
-        f"Expected REST fallback with >= 2 GET calls, got {mock_client_instance.get.call_count}"
-    )
-    assert isinstance(result, pd.DataFrame), "fetch_funding must return a DataFrame"
-    assert list(result.columns) == ["timestamp", "funding_rate"], (
-        f"Unexpected columns: {list(result.columns)}"
-    )
-    assert result["timestamp"].duplicated().sum() == 0, "Result contains duplicate timestamps"
-
-    start_dt = pd.Timestamp(start_ms, unit="ms", tz="UTC")
-    end_dt   = pd.Timestamp(end_ms,   unit="ms", tz="UTC")
-    assert (result["timestamp"] >= start_dt).all(), "Some records are before start_ms"
-    assert (result["timestamp"] < end_dt).all(),    "Some records are at or after end_ms"
-    assert result["timestamp"].is_monotonic_increasing, "Result is not sorted ascending"
-    assert result["funding_rate"].dtype == float, (
-        f"funding_rate dtype should be float, got {result['funding_rate'].dtype}"
-    )
-
-
-def test_fetch_funding_ccxt_descending_pages_accumulates_beyond_single_page():
-    """Descending ccxt pages should still advance across a long window.
-
-    This is the regression guard for the one-page failure mode: when MEXC/ccxt
-    returns newest-first pages, advancing via batch[-1] stalls near the first
-    page boundary. The funding path should instead keep moving forward and collect
-    materially more than 100 records without invoking REST fallback.
-    """
-    import sys
-    sys.path.insert(0, '/home/nebula/nyxml4')
-
-    from unittest.mock import patch, MagicMock
-    import ml.data_fetcher as df_module
-    from ml.data_fetcher import fetch_funding
-
-    interval_ms = 8 * 3600 * 1000
-    expected_points = 120
-    start_ms = 1_700_000_000_000
-    end_ms = start_ms + expected_points * interval_ms
-    all_ts = [start_ms + i * interval_ms for i in range(expected_points)]
-
-    def make_desc_page(start_idx, size):
-        ts_slice = all_ts[start_idx:start_idx + size]
-        return [
-            {"timestamp": ts, "fundingRate": 0.0001 + idx * 1e-7}
-            for idx, ts in enumerate(reversed(ts_slice))
-        ]
-
-    ccxt_pages = [
-        make_desc_page(0, 100),
-        make_desc_page(100, 20),
-        [],
-    ]
-
-    mock_exchange = MagicMock()
-    mock_exchange.fetch_funding_rate_history.side_effect = ccxt_pages
-    mock_exchange.load_markets.return_value = None
-
-    with patch.object(df_module.ccxt, "mexc", return_value=mock_exchange), \
-         patch("ml.data_fetcher.httpx.Client") as mock_client_cls, \
-         patch("ml.data_fetcher.time.sleep"):
-
-        mock_client_instance = MagicMock()
-        mock_client_instance.__enter__ = MagicMock(return_value=mock_client_instance)
-        mock_client_instance.__exit__ = MagicMock(return_value=False)
-        mock_client_cls.return_value = mock_client_instance
-
-        result = fetch_funding(start_ms, end_ms)
-
-    assert mock_exchange.fetch_funding_rate_history.call_count >= 2, (
-        f"Expected multi-page ccxt pagination, got {mock_exchange.fetch_funding_rate_history.call_count} call(s)"
-    )
-    assert mock_client_instance.get.call_count == 0, "REST fallback should not be needed when ccxt pages advance"
-    assert len(result) == expected_points, f"Expected {expected_points} funding rows, got {len(result)}"
-    assert len(result) > 100, "Regression guard failed: funding retrieval did not exceed one page"
-    assert result["timestamp"].is_monotonic_increasing, "ccxt result should be sorted ascending after normalization"
-    assert result["timestamp"].duplicated().sum() == 0, "ccxt result should be deduplicated"
+    assert set(result.keys()) == {"df5", "df15", "df1h", "cvd"}
+    assert "funding" not in result
+    assert result["df5"] is fake_df5
+    assert result["df15"] is fake_df15
+    assert result["df1h"] is fake_df1h
+    assert result["cvd"] is fake_cvd
 
 
 def test_volume_ratio_n1_excludes_self_from_mean():
