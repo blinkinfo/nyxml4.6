@@ -446,7 +446,6 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "enabled": True,
         "borderline_target_weight": 0.7,
         "vol_tail_weight": 0.85,
-        "funding_tail_weight": 0.9,
     }
     _sample_weight_result = derive_sample_weights(X_train, y_train, FEATURE_COLS, _sample_weight_cfg)
     _train_weights = _sample_weight_result["weights"]
@@ -677,7 +676,7 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         },
         "live_trust_gate": {
             "enabled": True,
-            "monitored_features": ["vol_regime", "funding_zscore", "atr_percentile_24h", "vol_zscore"],
+            "monitored_features": ["vol_regime", "atr_percentile_24h", "vol_zscore"],
             "zscore_limit": 3.5,
             "max_feature_breaches": 1,
             "max_validation_ece": 0.20,

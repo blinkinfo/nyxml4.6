@@ -19,7 +19,7 @@ def make_ohlcv(n=100, seed=42):
 
 
 def test_feature_count():
-    assert len(FEATURE_COLS) == 42
+    assert len(FEATURE_COLS) == 40
 
 
 def test_feature_order():
@@ -28,7 +28,6 @@ def test_feature_order():
                 'volume_ratio_n1', 'volume_ratio_n2',
                 'body_ratio_15m', 'dir_15m', 'volume_ratio_15m',
                 'body_ratio_1h', 'dir_1h', 'ema9_slope_1h',
-                'funding_rate', 'funding_zscore',
                 'body_ratio', 'upper_wick_ratio', 'lower_wick_ratio', 'vol_zscore', 'vol_trend',
                 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
                 'atr_percentile_24h', 'vol_regime',
@@ -87,7 +86,7 @@ def test_default_threshold_matches_blueprint():
 def test_asof_backward_vectorized_matches_searchsorted():
     """_asof_backward (now pd.merge_asof) must produce identical results to
     the previous searchsorted row-loop implementation for all call sites:
-    15m merge, 1h merge, and funding merge."""
+    15m merge and 1h merge."""
     import sys
     sys.path.insert(0, '/home/nebula/nyxml4')
     from ml.features import _asof_backward
@@ -215,21 +214,8 @@ def test_live_features_match_training_for_latest_closed_5m_row():
         .reset_index()
     )
 
-    funding_ts = pd.date_range(
-        ts_5m.min() - pd.Timedelta("16h"),
-        ts_5m.max() + pd.Timedelta("1h"),
-        freq="8h",
-        tz="UTC",
-    )
-    funding = pd.DataFrame(
-        {
-            "timestamp": funding_ts,
-            "funding_rate": rng.normal(0, 0.0001, len(funding_ts)),
-        }
-    )
-
     # Training features on full history
-    train_feat = build_features(df5, df15, df1h, funding)
+    train_feat = build_features(df5, df15, df1h)
     expected = train_feat[FEATURE_COLS].iloc[-2].to_numpy()
 
     # Live path semantics:
@@ -239,8 +225,6 @@ def test_live_features_match_training_for_latest_closed_5m_row():
         df5.iloc[:-1].copy(),
         df15.copy(),
         df1h.copy(),
-        float(funding["funding_rate"].iloc[-1]),
-        deque(funding["funding_rate"].tail(24).tolist(), maxlen=24),
     )
 
     assert live_row is not None, f"build_live_features returned None; nan_features={nan_features}"
@@ -248,35 +232,6 @@ def test_live_features_match_training_for_latest_closed_5m_row():
     got = live_row[0]
     np.testing.assert_allclose(got, expected, rtol=0.0, atol=1e-12)
 
-
-def test_build_features_preserves_rows_when_funding_zscore_warmup_is_short():
-    from ml.features import build_features
-
-    rng = np.random.default_rng(123)
-    n5 = 500
-    ts_5m = pd.date_range("2026-01-01", periods=n5, freq="5min", tz="UTC")
-    close = 50000 + np.cumsum(rng.normal(0, 20, n5))
-    open_ = close + rng.normal(0, 5, n5)
-    high = np.maximum(open_, close) + rng.uniform(0, 8, n5)
-    low = np.minimum(open_, close) - rng.uniform(0, 8, n5)
-    vol = rng.uniform(50, 200, n5)
-    df5 = pd.DataFrame({"timestamp": ts_5m, "open": open_, "high": high, "low": low, "close": close, "volume": vol})
-
-    s = df5.set_index("timestamp")
-    df15 = s.resample("15min").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna().reset_index()
-    df1h = s.resample("1h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna().reset_index()
-
-    funding_ts = pd.date_range(ts_5m.min() - pd.Timedelta("8h"), periods=8, freq="8h", tz="UTC")
-    funding = pd.DataFrame({
-        "timestamp": funding_ts,
-        "funding_rate": np.linspace(-0.0002, 0.0002, len(funding_ts)),
-    })
-
-    feat = build_features(df5, df15, df1h, funding)
-    assert not feat.empty, "build_features should retain rows even with short funding history"
-    assert feat["timestamp"].min() < ts_5m.max() - pd.Timedelta(days=1), "retained training window collapsed too far toward the end"
-    assert feat["funding_zscore"].notna().all(), "funding_zscore should use a neutral fallback instead of leaving NaN"
-    assert (feat["funding_rate"].notna()).all(), "funding_rate should still be present after asof merge for retained rows"
 
 
 def test_fetch_funding_mock():
@@ -468,7 +423,7 @@ def test_volume_ratio_n1_excludes_self_from_mean():
 # ===========================================================================
 
 def make_aligned_data(n=500, seed=99):
-    """Return (df5, df15, df1h, funding, funding_buf, funding_rate) with n 5m candles."""
+    """Return (df5, df15, df1h) with n 5m candles."""
     rng = np.random.default_rng(seed)
     ts = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
     close = 50000 + np.cumsum(rng.normal(0, 20, n))
@@ -483,14 +438,7 @@ def make_aligned_data(n=500, seed=99):
                                     "close":"last","volume":"sum"}).dropna().reset_index()
     df1h = s.resample("1h").agg({"open":"first","high":"max","low":"min",
                                   "close":"last","volume":"sum"}).dropna().reset_index()
-    fts = pd.date_range(ts.min()-pd.Timedelta("16h"), ts.max()+pd.Timedelta("1h"),
-                        freq="8h", tz="UTC")
-    funding = pd.DataFrame({"timestamp": fts,
-                             "funding_rate": rng.normal(0, 0.0001, len(fts))})
-    from collections import deque
-    funding_buf = deque(rng.normal(0, 0.0001, 24).tolist(), maxlen=24)
-    funding_rate = float(rng.normal(0, 0.0001))
-    return df5, df15, df1h, funding, funding_buf, funding_rate
+    return df5, df15, df1h
 
 
 def test_cvd_ratio_parity():
@@ -502,7 +450,7 @@ def test_cvd_ratio_parity():
     from collections import deque
     from ml.features import build_features, build_live_features, FEATURE_COLS
 
-    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=11)
+    df5, df15, df1h = make_aligned_data(seed=11)
 
     # Build a synthetic CVD DataFrame aligned with df5 timestamps
     rng = np.random.default_rng(42)
@@ -515,9 +463,9 @@ def test_cvd_ratio_parity():
         "short_taker_size": short_vol,
     })
 
-    train_feat = build_features(df5, df15, df1h, funding, cvd)
+    train_feat = build_features(df5, df15, df1h, cvd)
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf, cvd.copy())
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), cvd.copy())
 
     assert live_row is not None, f"live returned None; nan={nan_feats}"
     assert nan_feats == [], f"Unexpected NaN features: {nan_feats}"
@@ -543,11 +491,11 @@ def test_body_vs_range5_parity():
     from collections import deque
     from ml.features import build_features, build_live_features, FEATURE_COLS
 
-    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=22)
+    df5, df15, df1h = make_aligned_data(seed=22)
 
-    train_feat = build_features(df5, df15, df1h, funding)
+    train_feat = build_features(df5, df15, df1h)
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf)
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy())
 
     assert live_row is not None, f"live returned None; nan={nan_feats}"
 
@@ -598,11 +546,11 @@ def test_range_expansion_parity():
     from collections import deque
     from ml.features import build_features, build_live_features, FEATURE_COLS
 
-    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=33)
+    df5, df15, df1h = make_aligned_data(seed=33)
 
-    train_feat = build_features(df5, df15, df1h, funding)
+    train_feat = build_features(df5, df15, df1h)
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf)
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy())
 
     assert live_row is not None, f"live returned None; nan={nan_feats}"
 
@@ -645,11 +593,11 @@ def test_vwap_dist_20_parity():
     from collections import deque
     from ml.features import build_features, build_live_features, FEATURE_COLS, compute_atr14
 
-    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=44)
+    df5, df15, df1h = make_aligned_data(seed=44)
 
-    train_feat = build_features(df5, df15, df1h, funding)
+    train_feat = build_features(df5, df15, df1h)
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf)
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy())
 
     assert live_row is not None, f"live returned None; nan={nan_feats}"
 
@@ -688,9 +636,9 @@ def test_structure_features_no_nan_in_normal_conditions():
     from collections import deque
     from ml.features import build_features, build_live_features, FEATURE_COLS
 
-    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(n=500, seed=55)
+    df5, df15, df1h = make_aligned_data(n=500, seed=55)
     # CVD defaults to neutral (0.5 / 0.0) when not provided — still non-NaN
-    train_feat = build_features(df5, df15, df1h, funding)
+    train_feat = build_features(df5, df15, df1h)
 
     struct_feats = ["body_vs_range5", "range_expansion", "vwap_dist_20",
                     "cvd_ratio", "cvd_delta_norm"]
@@ -702,7 +650,7 @@ def test_structure_features_no_nan_in_normal_conditions():
             f"{feat}: {nan_count}/{total} NaN rows ({nan_count/total:.1%}) — exceeds 2% warmup allowance"
 
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf)
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy())
     assert live_row is not None, f"live returned None; nan={nan_feats}"
     for feat in struct_feats:
         i = FEATURE_COLS.index(feat)
@@ -716,7 +664,7 @@ def test_cvd_delta_norm_parity():
     from collections import deque
     from ml.features import build_features, build_live_features, FEATURE_COLS
 
-    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=77)
+    df5, df15, df1h = make_aligned_data(seed=77)
 
     # Build synthetic CVD data with known buy/sell dominance pattern
     rng = np.random.default_rng(99)
@@ -729,9 +677,9 @@ def test_cvd_delta_norm_parity():
         "short_taker_size": short_vol,
     })
 
-    train_feat = build_features(df5, df15, df1h, funding, cvd)
+    train_feat = build_features(df5, df15, df1h, cvd)
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf, cvd.copy())
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), cvd.copy())
 
     assert live_row is not None, f"live returned None; nan={nan_feats}"
     assert nan_feats == [], f"Unexpected NaN features: {nan_feats}"
@@ -754,12 +702,12 @@ def test_sample_quality_weights_are_bounded():
     import numpy as np
     from ml.probability import derive_sample_weights
 
-    feature_names = ["body_ratio", "vol_regime", "funding_zscore"]
+    feature_names = ["body_ratio", "vol_regime", "atr_percentile_24h"]
     X = np.array([
-        [0.01, -3.0, -3.0],
-        [0.02, 0.0, 0.0],
-        [0.50, 1.0, 1.0],
-        [0.80, 3.5, 3.5],
+        [0.01, -3.0, 0.1],
+        [0.02, 0.0, 0.5],
+        [0.50, 1.0, 0.8],
+        [0.80, 3.5, 0.95],
     ] * 20, dtype=float)
     y = np.array(([0, 1, 1, 0] * 20), dtype=int)
     result = derive_sample_weights(X, y, feature_names, {"enabled": True})

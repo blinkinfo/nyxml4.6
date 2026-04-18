@@ -44,8 +44,8 @@ def _get_strategy():
                 strategy_name,
             )
             # Do NOT cache a broken/None value — allow retry on the next slot
-            # so a transient failure (e.g. network in _seed_funding_buffer)
-            # doesn't permanently disable signals for the life of the process.
+            # so a transient initialization failure does not permanently disable
+            # signals for the life of the process.
             return None
     return _strategy
 

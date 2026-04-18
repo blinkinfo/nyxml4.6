@@ -350,7 +350,6 @@ def derive_sample_weights(
     weights = np.ones(len(y), dtype=float)
     borderline_target = float(cfg.get("borderline_target_weight", 0.7))
     vol_tail_weight = float(cfg.get("vol_tail_weight", 0.85))
-    funding_tail_weight = float(cfg.get("funding_tail_weight", 0.9))
 
     def _maybe_apply(feature: str, low_pct: float | None = None, high_pct: float | None = None, tail_weight: float = 1.0):
         if feature not in feature_names:
@@ -396,7 +395,6 @@ def derive_sample_weights(
     applied = [x for x in [
         body_info,
         _maybe_apply("vol_regime", 2.5, 97.5, vol_tail_weight),
-        _maybe_apply("funding_zscore", 2.5, 97.5, funding_tail_weight),
     ] if x is not None]
 
     weights = np.clip(weights, 0.25, 1.0)
@@ -452,7 +450,7 @@ def build_live_trust_report(
             "max_validation_ece": float(trust_cfg.get("max_validation_ece", 0.20)),
         }
         if isinstance(stats, dict) and trust_cfg.get("enabled", True):
-            monitored = trust_cfg.get("monitored_features") or ["vol_regime", "funding_zscore", "atr_percentile_24h", "vol_zscore"]
+            monitored = trust_cfg.get("monitored_features") or ["vol_regime", "atr_percentile_24h", "vol_zscore"]
             sigma = float(trust_cfg.get("zscore_limit", 3.5))
             breaches = []
             for fname in monitored:

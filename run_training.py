@@ -7,10 +7,10 @@ from ml import data_fetcher, features as feat_eng, trainer, model_store
 
 print('Fetching 9 months of MEXC data...')
 data = data_fetcher.fetch_all(months=9)
-print(f'5m: {len(data["df5"])}, 15m: {len(data["df15"])}, 1h: {len(data["df1h"])}, funding: {len(data["funding"])}, cvd: {len(data["cvd"])}')
+print(f'5m: {len(data["df5"])}, 15m: {len(data["df15"])}, 1h: {len(data["df1h"])}, cvd: {len(data["cvd"])}')
 
 print('Building features...')
-df_feat = feat_eng.build_features(data['df5'], data['df15'], data['df1h'], data['funding'], data['cvd'])
+df_feat = feat_eng.build_features(data['df5'], data['df15'], data['df1h'], data['cvd'])
 print(f'Feature matrix: {df_feat.shape}')
 assert all(col in df_feat.columns for col in feat_eng.FEATURE_COLS), f'Missing feature columns: {[c for c in feat_eng.FEATURE_COLS if c not in df_feat.columns]}'
 assert list(df_feat[feat_eng.FEATURE_COLS].columns) == feat_eng.FEATURE_COLS, f'Feature order mismatch: {list(df_feat.columns)}'

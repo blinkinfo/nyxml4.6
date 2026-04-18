@@ -60,7 +60,7 @@ main.py
   │       ├── ml_strategy.py      # LightGBM model inference
   │       └── pattern_strategy.py # Historical candlestick pattern matching
   ├── ml/
-  │   ├── features.py             # 26-feature engineering (zero lookahead bias)
+  │   ├── features.py             # 40-feature engineering (zero lookahead bias)
   │   ├── trainer.py              # LightGBM training with walk-forward validation
   │   ├── data_fetcher.py         # MEXC OHLCV + CVD data fetching (ccxt + REST)
   │   └── model_store.py          # Model serialization / staging / promotion
@@ -142,8 +142,8 @@ The active strategy is selected by `STRATEGY_NAME` env var (default: `"ml"`). St
 ### ML Strategy (`core/strategies/ml_strategy.py`)
 
 - Loads a pre-trained LightGBM model from `models/production.lgb`
-- Fetches live MEXC OHLCV + CVD data via `ml/data_fetcher.py`
-- Builds 26 features via `ml/features.py`
+- Fetches live MEXC OHLCV + Gate.io CVD data via `ml/data_fetcher.py`
+- Builds 40 features via `ml/features.py`
 - Produces a binary probability; fires a trade if confidence ≥ threshold
 - **Separate thresholds for UP and DOWN** directions (`ML_UP_THRESHOLD`, `ML_DOWN_THRESHOLD`)
 - Default threshold: **0.535** (targets ~64% WR at ~50 trades/day)
@@ -166,25 +166,27 @@ The active strategy is selected by `STRATEGY_NAME` env var (default: `"ml"`). St
 
 ### Data Sources
 
-All training data comes exclusively from **MEXC** (spot + futures):
+Training uses MEXC OHLCV plus Gate.io taker-flow context:
 - **OHLCV:** MEXC spot BTC/USDT 5-minute candles via `ccxt`
-- **CVD (Cumulative Volume Delta):** MEXC futures kline API (`contract.mexc.com`)
+- **CVD (Cumulative Volume Delta):** Gate.io futures taker-flow data
 - **Multi-timeframe context:** 15-minute and 1-hour aggregations computed from 5-min data
 
 ### Feature Engineering (`ml/features.py`)
 
-26 features — zero lookahead bias (all features use `shift(k≥1)`):
+40 features — zero lookahead bias (all features use `shift(k>=1)`):
 
 | Group | Features |
 |-------|----------|
 | **Candle shape (7)** | `body_ratio_n1`, `body_ratio_n2`, `body_ratio_n3`, `upper_wick_n1`, `upper_wick_n2`, `lower_wick_n1`, `lower_wick_n2` |
 | **Volume (2)** | `volume_ratio_n1`, `volume_ratio_n2` |
 | **15m context (3)** | `body_ratio_15m`, `dir_15m`, `volume_ratio_15m` |
-| **1h context (3)** | `body_ratio_1h`, `dir_1h`, `volume_ratio_1h` |
-| **Funding (2)** | `funding_rate`, `funding_direction` |
-| **CVD (5)** | `cvd_delta_n1`, `cvd_delta_n2`, `cvd_slope`, `cvd_vs_price`, `cvd_acceleration` |
-| **Time-of-day (2)** | `hour_sin`, `hour_cos` |
-| **Volatility regime (2)** | `atr_ratio`, `vol_regime` |
+| **1h context (3)** | `body_ratio_1h`, `dir_1h`, `ema9_slope_1h` |
+| **OHLCV pressure (5)** | `body_ratio`, `upper_wick_ratio`, `lower_wick_ratio`, `vol_zscore`, `vol_trend` |
+| **Time-of-day (4)** | `hour_sin`, `hour_cos`, `dow_sin`, `dow_cos` |
+| **Volatility regime (2)** | `atr_percentile_24h`, `vol_regime` |
+| **Momentum (4)** | `rsi14`, `candle_streak`, `price_in_range`, `ema_cross_5m` |
+| **Structure (3)** | `body_vs_range5`, `range_expansion`, `vwap_dist_20` |
+| **Gate.io CVD and OI flow (7)** | `cvd_ratio`, `cvd_delta_norm`, `cvd_cumulative_5`, `cvd_cumulative_20`, `cvd_trend_slope`, `cvd_divergence`, `oi_change_5bar` |
 
 Target label: `1` = next candle closes UP, `0` = DOWN (`shift(-1)` — only used for training labels, never as a feature).
 
@@ -450,7 +452,7 @@ Before running with the ML strategy, train an initial model:
 | FOK retry backoff | exponential | `trader.py` | Price refresh on each attempt |
 | LGBM `num_leaves` | 63 | `trainer.py` | Tree complexity |
 | LGBM `learning_rate` | 0.05 | `trainer.py` | Step size |
-| Feature count | 26 | `ml/features.py` | Total engineered features |
+| Feature count | 40 | `ml/features.py` | Total engineered features |
 | Demo win payout | 0.85× stake | `trade_manager.py` | Simulated Polymarket payout |
 | Demo loss | 1.0× stake | `trade_manager.py` | Full stake loss on loss |
 

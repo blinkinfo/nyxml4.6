@@ -1207,7 +1207,7 @@ async def _retrain_background(application, chat_id) -> None:
         df_feat = await _asyncio.wait_for(
             loop.run_in_executor(
                 None, lambda: feat_eng.build_features(
-                    data["df5"], data["df15"], data["df1h"], data["funding"], data["cvd"]
+                    data["df5"], data["df15"], data["df1h"], data["cvd"]
                 )
             ),
             timeout=1500,

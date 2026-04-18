@@ -2,7 +2,7 @@
 
 Each call to check_signal() writes one JSONL record containing:
   - slot metadata (slug, timestamps)
-  - raw data quality indicators (row counts, candle timestamps, buffer length)
+  - raw data quality indicators (row counts and candle timestamps)
   - every feature value with its name
   - NaN breakdown when inference is skipped due to missing features
   - model probability and threshold values
@@ -118,7 +118,6 @@ def log_inference(
     df15_rows: int,
     df1h_rows: int,
     cvd_rows: int,
-    funding_buf_len: int,
     candle_n1_ts: str | None,       # ISO timestamp of the N-1 5m candle
     candle_n1_close: float | None,  # close price of N-1 candle
     candle_n1_vol: float | None,    # volume of N-1 candle
@@ -166,7 +165,6 @@ def log_inference(
                 "df15_rows":       df15_rows,
                 "df1h_rows":       df1h_rows,
                 "cvd_rows":        cvd_rows,
-                "funding_buf_len": funding_buf_len,
                 "candle_n1_ts":    candle_n1_ts,
                 "candle_n1_close": _safe_float(candle_n1_close),
                 "candle_n1_vol":   _safe_float(candle_n1_vol),
@@ -175,7 +173,7 @@ def log_inference(
             # NaN breakdown — which features were missing and why inference skipped
             "nan_features": nan_features,
 
-            # All 26 feature values (None where NaN/missing)
+            # All feature values (None where NaN/missing)
             "features": _serialise_features(feature_names, feature_row),
 
             # Model output
@@ -335,7 +333,6 @@ def log_skipped_data(
     df15_rows: int = 0,
     df1h_rows: int = 0,
     cvd_rows: int = 0,
-    funding_buf_len: int = 0,
     nan_features: list[str] | None = None,
 ) -> None:
     """Convenience wrapper for slots skipped before model inference
@@ -354,7 +351,6 @@ def log_skipped_data(
         df15_rows=df15_rows,
         df1h_rows=df1h_rows,
         cvd_rows=cvd_rows,
-        funding_buf_len=funding_buf_len,
         candle_n1_ts=None,
         candle_n1_close=None,
         candle_n1_vol=None,

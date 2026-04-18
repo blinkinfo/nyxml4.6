@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import deque
-from datetime import datetime, timezone
 from typing import Any
 
 
@@ -25,7 +23,7 @@ import config as cfg
 
 log = logging.getLogger(__name__)
 
-FEATURE_COLS = feat_eng.FEATURE_COLS  # 42 features in exact order
+FEATURE_COLS = feat_eng.FEATURE_COLS  # 40 features in exact order
 
 
 def _trust_reason_summary(reasons: list[str] | None) -> str:
@@ -72,17 +70,7 @@ class MLStrategy(BaseStrategy):
 
     def __init__(self):
         self._model = None
-        self._funding_buffer: deque = deque(maxlen=24)
         self._model_slot = "current"
-        # Track the last funding settlement timestamp that was appended to the
-        # buffer.  MEXC settles funding every 8h (00:00, 08:00, 16:00 UTC).
-        # We only append to the buffer when a new settlement period has started,
-        # matching the training data semantics where each buffer entry represents
-        # one distinct 8h settlement — not a repeated 5m snapshot of the same rate.
-        self._last_funding_settlement: datetime | None = None
-        # Each step is individually guarded so a failure in one never prevents
-        # the other from running, and a constructor crash can never propagate
-        # up to _get_strategy() / the scheduler.
         try:
             self._load_model()
         except Exception:
@@ -90,48 +78,7 @@ class MLStrategy(BaseStrategy):
                 "MLStrategy.__init__: _load_model failed — model will be None; "
                 "signals will be skipped until a model is loaded via set_model() or /retrain"
             )
-        try:
-            self._seed_funding_buffer()
-        except Exception:
-            log.exception(
-                "MLStrategy.__init__: _seed_funding_buffer failed — "
-                "funding zscore will be undefined for the first live periods; "
-                "inference will continue with an empty buffer"
-            )
 
-    def _seed_funding_buffer(self) -> None:
-        """Seed the funding buffer with historical data on startup.
-
-        Without seeding, the buffer starts empty and zscore is undefined for the
-        first 8 days of operation (24 periods * 8h each). This pre-fills the buffer
-        from MEXC historical funding so zscore is valid from the very first inference.
-        """
-        try:
-            history = data_fetcher.fetch_live_funding_history(n_periods=24)
-            if history:
-                for rate in history:
-                    self._funding_buffer.append(rate)
-                log.info(
-                    "MLStrategy: seeded funding_buffer with %d historical records",
-                    len(self._funding_buffer),
-                )
-            else:
-                log.warning("MLStrategy: could not seed funding_buffer — no historical data returned")
-        except Exception as exc:
-            log.warning("MLStrategy: funding_buffer seed failed: %s", exc)
-
-    @staticmethod
-    def _current_funding_settlement() -> datetime:
-        """Return the most recent MEXC funding settlement timestamp (UTC).
-
-        MEXC settles funding at 00:00, 08:00, and 16:00 UTC every day.
-        This returns the floor of utcnow() to the nearest 8h boundary,
-        giving a stable, deterministic key for deduplication.
-        """
-        now = datetime.now(timezone.utc)
-        # Hours since midnight, floored to 8h block: 0, 8, or 16
-        settlement_hour = (now.hour // 8) * 8
-        return now.replace(hour=settlement_hour, minute=0, second=0, microsecond=0)
 
     def _load_model(self) -> None:
         """Load the current model — use preloaded model if available, else load from disk."""
@@ -249,11 +196,10 @@ class MLStrategy(BaseStrategy):
         try:
             # Fetch live data in parallel using executor (blocking ccxt calls)
             loop = asyncio.get_running_loop()
-            df5, df15, df1h, funding_rate, cvd_live = await asyncio.gather(
+            df5, df15, df1h, cvd_live = await asyncio.gather(
                 loop.run_in_executor(None, lambda: data_fetcher.fetch_live_5m(400)),
                 loop.run_in_executor(None, lambda: data_fetcher.fetch_live_15m(100)),
                 loop.run_in_executor(None, lambda: data_fetcher.fetch_live_1h(60)),
-                loop.run_in_executor(None, data_fetcher.fetch_live_funding),
                 loop.run_in_executor(None, lambda: data_fetcher.fetch_live_gate_cvd(400)),
             )
 
@@ -273,7 +219,7 @@ class MLStrategy(BaseStrategy):
             # row whose target we are predicting), and all feature shifts are k>=1.
             # Trimming df5 before calling build_live_features shifts every index by one,
             # making safe(s,1) return N-2 instead of N-1 — a systematic one-candle lag
-            # that corrupts all 42 features and inverts the model's predictions.
+            # that corrupts the feature row and inverts the model's predictions.
             #
             # 15m/1h/CVD are also NOT trimmed: build_live_features selects the most
             # recent candle with timestamp <= ts_n1 (the N-1 5m bar's timestamp) via
@@ -305,24 +251,10 @@ class MLStrategy(BaseStrategy):
                 except Exception as _e:
                     log.debug("inference_logger: candle_n1 extraction failed: %s", _e)
 
-            # Update funding rolling buffer — only append when a new 8h settlement
-            # has occurred, matching training data semantics (one entry per settlement
-            # period, not one entry per 5m check_signal call).
-            if funding_rate is not None:
-                current_settlement = self._current_funding_settlement()
-                if self._last_funding_settlement != current_settlement:
-                    self._funding_buffer.append(funding_rate)
-                    self._last_funding_settlement = current_settlement
-                    log.debug(
-                        "MLStrategy: funding_buffer updated for settlement=%s rate=%.6f buffer_len=%d",
-                        current_settlement.isoformat(), funding_rate, len(self._funding_buffer),
-                    )
-
-            funding_buf_len = len(self._funding_buffer)
 
             # Build feature row — returns (row, nan_features) 2-tuple
             feature_row, nan_features = feat_eng.build_live_features(
-                df5, df15, df1h, funding_rate, self._funding_buffer, cvd_live
+                df5, df15, df1h, cvd_live
             )
             if feature_row is None:
                 log.warning("MLStrategy: insufficient data for features, skipping")
@@ -335,7 +267,6 @@ class MLStrategy(BaseStrategy):
                     df15_rows=df15_rows,
                     df1h_rows=df1h_rows,
                     cvd_rows=cvd_rows,
-                    funding_buf_len=funding_buf_len,
                     candle_n1_ts=candle_n1_ts,
                     candle_n1_close=candle_n1_close,
                     candle_n1_vol=candle_n1_vol,
@@ -438,7 +369,6 @@ class MLStrategy(BaseStrategy):
                                 df15_rows=df15_rows,
                                 df1h_rows=df1h_rows,
                                 cvd_rows=cvd_rows,
-                                funding_buf_len=funding_buf_len,
                                 candle_n1_ts=candle_n1_ts,
                                 candle_n1_close=candle_n1_close,
                                 candle_n1_vol=candle_n1_vol,
@@ -489,7 +419,6 @@ class MLStrategy(BaseStrategy):
                     df15_rows=df15_rows,
                     df1h_rows=df1h_rows,
                     cvd_rows=cvd_rows,
-                    funding_buf_len=funding_buf_len,
                     candle_n1_ts=candle_n1_ts,
                     candle_n1_close=candle_n1_close,
                     candle_n1_vol=candle_n1_vol,
@@ -558,7 +487,6 @@ class MLStrategy(BaseStrategy):
                     df15_rows=df15_rows,
                     df1h_rows=df1h_rows,
                     cvd_rows=cvd_rows,
-                    funding_buf_len=funding_buf_len,
                     candle_n1_ts=candle_n1_ts,
                     candle_n1_close=candle_n1_close,
                     candle_n1_vol=candle_n1_vol,
@@ -610,7 +538,6 @@ class MLStrategy(BaseStrategy):
                     df15_rows=df15_rows,
                     df1h_rows=df1h_rows,
                     cvd_rows=cvd_rows,
-                    funding_buf_len=funding_buf_len,
                     candle_n1_ts=candle_n1_ts,
                     candle_n1_close=candle_n1_close,
                     candle_n1_vol=candle_n1_vol,
@@ -658,7 +585,6 @@ class MLStrategy(BaseStrategy):
                 df15_rows=df15_rows,
                 df1h_rows=df1h_rows,
                 cvd_rows=cvd_rows,
-                funding_buf_len=funding_buf_len,
                 candle_n1_ts=candle_n1_ts,
                 candle_n1_close=candle_n1_close,
                 candle_n1_vol=candle_n1_vol,

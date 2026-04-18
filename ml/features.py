@@ -7,8 +7,8 @@ Target semantics: 1 if the NEXT candle closes at or above its own open
 (close[i+1] >= open[i+1]), matching Polymarket's settlement logic
 (resolver.py: winner = "Up" if close_price >= open_price else "Down").
 
-42 features total: candle shape (7), volume (2), 15m context (3), 1h context (3),
-funding (2), OHLCV pressure (5), time-of-day cyclical (4), volatility regime (2),
+40 features total: candle shape (7), volume (2), 15m context (3), 1h context (3),
+OHLCV pressure (5), time-of-day cyclical (4), volatility regime (2),
 momentum (4: rsi14, candle_streak, price_in_range, ema_cross_5m),
 structure (3: body_vs_range5, range_expansion, vwap_dist_20),
 Gate.io CVD taker flow (7: cvd_ratio, cvd_delta_norm, cvd_cumulative_5,
@@ -26,7 +26,7 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Feature column order — MUST match exactly (42 features)
+# Feature column order — MUST match exactly (40 features)
 # ---------------------------------------------------------------------------
 FEATURE_COLS = [
     "body_ratio_n1", "body_ratio_n2", "body_ratio_n3",
@@ -35,7 +35,6 @@ FEATURE_COLS = [
     "volume_ratio_n1", "volume_ratio_n2",
     "body_ratio_15m", "dir_15m", "volume_ratio_15m",
     "body_ratio_1h", "dir_1h", "ema9_slope_1h",
-    "funding_rate", "funding_zscore",
     "body_ratio", "upper_wick_ratio", "lower_wick_ratio", "vol_zscore", "vol_trend",
     "hour_sin", "hour_cos", "dow_sin", "dow_cos",  # cyclical time (replaces hour_utc, dow)
     "atr_percentile_24h", "vol_regime",
@@ -125,16 +124,14 @@ def build_features(
     df5: pd.DataFrame,
     df15: pd.DataFrame,
     df1h: pd.DataFrame,
-    funding: pd.DataFrame,
     cvd: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Build 42 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'.
+    """Build 40 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'.
 
     Args:
         df5:     5m OHLCV candles from MEXC spot.
         df15:    15m OHLCV candles from MEXC futures.
         df1h:    1h OHLCV candles from MEXC futures.
-        funding: Funding rate history from MEXC futures.
         cvd:     Gate.io 5m taker volume DataFrame with columns:
                  timestamp, long_taker_size, short_taker_size, open_interest.
                  Used to compute 7 CVD/OI features:
@@ -154,16 +151,14 @@ def build_features(
     df5 = df5.copy().reset_index(drop=True)
     df15 = df15.copy().reset_index(drop=True)
     df1h = df1h.copy().reset_index(drop=True)
-    funding = funding.copy().reset_index(drop=True)
 
     # Sort ascending (should already be sorted, but be safe)
     df5 = df5.sort_values("timestamp").reset_index(drop=True)
     df15 = df15.sort_values("timestamp").reset_index(drop=True)
     df1h = df1h.sort_values("timestamp").reset_index(drop=True)
-    funding = funding.sort_values("timestamp").reset_index(drop=True)
 
     # Normalize all timestamps to ms UTC for consistent merging
-    for df in [df5, df15, df1h, funding]:
+    for df in [df5, df15, df1h]:
         df["timestamp"] = df["timestamp"].astype("datetime64[ms, UTC]")
 
     # -----------------------------------------------------------------------
@@ -229,41 +224,6 @@ def build_features(
     df5["body_ratio_1h"] = r1h["body_ratio_1h"].values
     df5["dir_1h"] = r1h["dir_1h"].values
     df5["ema9_slope_1h"] = r1h["ema9_slope_1h"].values
-
-    # -----------------------------------------------------------------------
-    # Funding features
-    # -----------------------------------------------------------------------
-    _funding_roll_mean = funding["funding_rate"].rolling(24, min_periods=2).mean()
-    _funding_roll_std = funding["funding_rate"].rolling(24, min_periods=2).std()
-    funding["funding_zscore"] = (
-        funding["funding_rate"] - _funding_roll_mean
-    ) / _funding_roll_std
-    _funding_neutral_mask = funding["funding_rate"].notna() & (
-        _funding_roll_std.isna() | (_funding_roll_std <= 0)
-    )
-    funding.loc[_funding_neutral_mask, "funding_zscore"] = 0.0
-
-    rf = _asof_backward(ts_n1, funding, ["funding_rate", "funding_zscore"])
-    df5["funding_rate"] = rf["funding_rate"].values
-    df5["funding_zscore"] = rf["funding_zscore"].values
-    _funding_rate_missing = int(df5["funding_rate"].isna().sum())
-    _funding_zscore_neutral = int(df5["funding_zscore"].eq(0.0).sum())
-    if _funding_rate_missing > 0:
-        log.warning(
-            "build_features: funding_rate missing for %d rows after asof merge; those rows may still be dropped",
-            _funding_rate_missing,
-        )
-    if _funding_neutral_mask.any():
-        log.info(
-            "build_features: funding_zscore used neutral fallback for %d funding history rows before full 24-point history was available",
-            int(_funding_neutral_mask.sum()),
-        )
-    log.info(
-        "build_features: funding merge summary rows=%d funding_rate_missing=%d funding_zscore_neutral_rows=%d",
-        len(df5),
-        _funding_rate_missing,
-        _funding_zscore_neutral,
-    )
 
     # -----------------------------------------------------------------------
     # OHLCV-native pressure features — computed purely from df5, zero parity gap
@@ -598,15 +558,13 @@ def build_live_features(
     df5_live: pd.DataFrame,
     df15_live: pd.DataFrame,
     df1h_live: pd.DataFrame,
-    funding_rate_float: float | None,
-    funding_buffer: deque,
     cvd_live: pd.DataFrame | None = None,
 ) -> "tuple[np.ndarray, list[str]] | tuple[None, list[str]]":
     """
-    Build a single feature row (shape 1×42) for live inference.
+    Build a single feature row (shape 1×40) for live inference.
 
     Returns a 2-tuple (feature_row, nan_features):
-      - feature_row : np.ndarray shape (1, 42), or None on hard failure.
+      - feature_row : np.ndarray shape (1, 40), or None on hard failure.
       - nan_features: list of feature names that were NaN (empty on success).
                       Populated even when feature_row is None so callers can
                       log exactly which features caused the skip.
@@ -619,8 +577,6 @@ def build_live_features(
         df5_live:           5m OHLCV candles (live window).
         df15_live:          15m OHLCV candles (live window).
         df1h_live:          1h OHLCV candles (live window).
-        funding_rate_float: Most recent funding rate float.
-        funding_buffer:     Rolling deque of recent funding rates.
         cvd_live:           Gate.io 5m taker volume DataFrame
                             (columns: timestamp, long_taker_size, short_taker_size,
                             open_interest).
@@ -762,20 +718,6 @@ def build_live_features(
             body_ratio_1h = dir_1h = ema9_slope_1h = np.nan
     else:
         body_ratio_1h = dir_1h = ema9_slope_1h = np.nan
-
-    # Funding features
-    if funding_rate_float is not None and len(funding_buffer) > 0:
-        buf = list(funding_buffer)
-        fr = funding_rate_float
-        if len(buf) >= 2:
-            mean24 = np.mean(buf)
-            std24 = np.std(buf, ddof=1) if len(buf) >= 2 else 0.0
-            funding_zscore = (fr - mean24) / std24 if std24 > 0 else np.nan
-        else:
-            funding_zscore = np.nan
-    else:
-        fr = np.nan
-        funding_zscore = np.nan
 
     # OHLCV-native pressure features (live) — identical formulas to build_features.
     # df5[-1] is the forming candle N (present, never read as a feature).
@@ -1130,7 +1072,6 @@ def build_live_features(
         vol_ratio_n1, vol_ratio_n2,
         body_ratio_15m, dir_15m, vol_ratio_15m,
         body_ratio_1h, dir_1h, ema9_slope_1h,
-        fr, funding_zscore,
         body_ratio, upper_wick_ratio, lower_wick_ratio, vol_zscore, vol_trend,
         hour_sin, hour_cos, dow_sin, dow_cos,
         atr_percentile_24h, vol_regime,
