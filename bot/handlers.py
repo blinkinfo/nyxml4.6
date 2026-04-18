@@ -86,6 +86,17 @@ def _uptime() -> str:
     return f"{minutes}m"
 
 
+def _parse_threshold_input(raw: str) -> float:
+    """Parse a user-provided threshold value.
+
+    Accepts any finite numeric input and rejects non-numeric or non-finite values.
+    """
+    value = float(raw.strip())
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError("non-finite")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Safe edit helper — silently ignores 'Message is not modified' errors
 # ---------------------------------------------------------------------------
@@ -720,7 +731,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_edit(
             query,
             f"\u2699\ufe0f <b>Set ML Threshold</b>\n\nCurrent threshold: <b>{threshold:.3f}</b>\n\n"
-            "Type the new threshold value (0.50 – 0.95):\n"
+            "Type the new threshold value. Any numeric value is accepted.\n"
             "Example: <code>0.56</code>",
         )
         context.user_data["awaiting_ml_threshold"] = True
@@ -731,7 +742,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_edit(
             query,
             f"\u2699\ufe0f <b>Set ML DOWN Threshold</b>\n\nCurrent DOWN threshold: <b>{threshold:.3f}</b>\n\n"
-            "Type the new DOWN threshold value (0.50 \u2013 0.95):\n"
+            "Type the new DOWN threshold value. Any numeric value is accepted.\n"
             "Example: <code>0.55</code>",
         )
         context.user_data["awaiting_ml_down_threshold"] = True
@@ -880,12 +891,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data["awaiting_ml_threshold"] = False
         raw = update.message.text.strip()
         try:
-            threshold = float(raw)
-            if not (0.50 <= threshold <= 0.95):
-                raise ValueError("out of range")
+            threshold = _parse_threshold_input(raw)
         except ValueError:
             await update.message.reply_text(
-                "\u274c Invalid value. Enter a number between 0.50 and 0.95 (e.g. <code>0.56</code>).",
+                "\u274c Invalid value. Enter any numeric threshold (e.g. <code>0.56</code>).",
                 parse_mode="HTML",
             )
             return
@@ -902,12 +911,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data["awaiting_ml_down_threshold"] = False
         raw = update.message.text.strip()
         try:
-            threshold = float(raw)
-            if not (0.50 <= threshold <= 0.95):
-                raise ValueError("out of range")
+            threshold = _parse_threshold_input(raw)
         except ValueError:
             await update.message.reply_text(
-                "\u274c Invalid value. Enter a number between 0.50 and 0.95 (e.g. <code>0.55</code>).",
+                "\u274c Invalid value. Enter any numeric DOWN threshold (e.g. <code>0.55</code>).",
                 parse_mode="HTML",
             )
             return
@@ -1036,18 +1043,16 @@ async def cmd_set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Set ML inference threshold. Usage: /set_threshold 0.56"""
     if not context.args:
         await update.message.reply_text(
-            "Usage: /set_threshold &lt;value&gt;\nExample: /set_threshold 0.56\nValid range: 0.50 - 0.95",
+            "Usage: /set_threshold &lt;value&gt;\nExample: /set_threshold 0.56\nAny numeric value is accepted.",
             parse_mode="HTML",
         )
         return
     try:
-        threshold = float(context.args[0])
+        threshold = _parse_threshold_input(context.args[0])
     except (ValueError, IndexError):
-        await update.message.reply_text("Invalid value. Example: /set_threshold 0.56", parse_mode="HTML")
-        return
-    if not (0.50 <= threshold <= 0.95):
         await update.message.reply_text(
-            "Threshold must be between 0.50 and 0.95.", parse_mode="HTML"
+            "Invalid value. Example: /set_threshold 0.56\nEnter any numeric threshold.",
+            parse_mode="HTML",
         )
         return
     await queries.set_ml_threshold(threshold)
@@ -1062,20 +1067,16 @@ async def cmd_set_down_threshold(update: Update, context: ContextTypes.DEFAULT_T
     """Set ML DOWN inference threshold. Usage: /set_down_threshold 0.55"""
     if not context.args:
         await update.message.reply_text(
-            "Usage: /set_down_threshold &lt;value&gt;\nExample: /set_down_threshold 0.55\nValid range: 0.50 – 0.95",
+            "Usage: /set_down_threshold &lt;value&gt;\nExample: /set_down_threshold 0.55\nAny numeric value is accepted.",
             parse_mode="HTML",
         )
         return
     try:
-        threshold = float(context.args[0])
+        threshold = _parse_threshold_input(context.args[0])
     except (ValueError, IndexError):
         await update.message.reply_text(
-            "Invalid value. Example: /set_down_threshold 0.55", parse_mode="HTML"
-        )
-        return
-    if not (0.50 <= threshold <= 0.95):
-        await update.message.reply_text(
-            "Threshold must be between 0.50 and 0.95.", parse_mode="HTML"
+            "Invalid value. Example: /set_down_threshold 0.55\nEnter any numeric DOWN threshold.",
+            parse_mode="HTML",
         )
         return
     await queries.set_ml_down_threshold(threshold)
