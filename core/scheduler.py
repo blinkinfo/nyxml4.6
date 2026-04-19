@@ -58,6 +58,16 @@ async def _send_telegram(text: str) -> None:
         log.exception("Failed to send Telegram message")
 
 
+def _calculate_resolution_pnl(amount_usdc: float, entry_price: float, is_win: bool) -> float:
+    """Return fee-adjusted PnL for a resolved binary trade."""
+    if not is_win:
+        return -amount_usdc
+
+    gross_shares = amount_usdc / entry_price
+    fee_usdc = gross_shares * 0.072 * entry_price * (1.0 - entry_price)
+    return gross_shares - amount_usdc - fee_usdc
+
+
 async def _resolve_and_notify(signal_id: int, slug: str, side: str, entry_price: float,
                                slot_start: str, slot_end: str, trade_id: int | None,
                                amount_usdc: float | None,
@@ -113,14 +123,11 @@ async def _resolve_and_notify(signal_id: int, slug: str, side: str, entry_price:
 
     # Send trade result only if a trade was actually placed
     if trade_id is not None and amount_usdc is not None:
-        if is_win:
-            pnl = round(amount_usdc * 0.85, 4) if is_demo else round(amount_usdc * (1.0 / entry_price - 1.0), 4)
-        else:
-            pnl = -amount_usdc
+        pnl = round(_calculate_resolution_pnl(amount_usdc, entry_price, is_win), 4)
         await queries.resolve_trade(trade_id, winner, is_win, pnl)
 
         if is_demo:
-            # Credit demo bankroll on win (loss was already deducted at entry)
+            # Credit demo bankroll with the resolved payout on win; loss was already deducted at entry.
             if is_win:
                 new_bankroll = await queries.adjust_demo_bankroll(amount_usdc + pnl)
             else:
@@ -190,13 +197,10 @@ async def _reconcile_pending() -> None:
 
         pnl: float | None = None
         if trade_id is not None and amount_usdc is not None:
-            if is_win:
-                pnl = round(amount_usdc * 0.85, 4) if is_demo else round(amount_usdc * (1.0 / entry_price - 1.0), 4)
-            else:
-                pnl = -amount_usdc
+            pnl = round(_calculate_resolution_pnl(amount_usdc, entry_price, is_win), 4)
             await queries.resolve_trade(trade_id, winner, is_win, pnl)
 
-            # Credit demo bankroll on resolution (mirrors _resolve_and_notify)
+            # Credit demo bankroll with the resolved payout on win (mirrors _resolve_and_notify).
             if is_demo and pnl is not None:
                 if is_win:
                     await queries.adjust_demo_bankroll(amount_usdc + pnl)

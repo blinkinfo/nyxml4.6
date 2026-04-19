@@ -105,9 +105,11 @@ Toggle via the `/demo` Telegram command or the `DEMO_MODE` environment variable.
 
 ### Demo Payout Structure
 
-In demo mode, simulated P&L uses Polymarket-style binary payout:
-- **Win:** `+0.85 × stake` profit (e.g. stake $1 → +$0.85)
-- **Lose:** `−1.0 × stake` loss (e.g. stake $1 → −$1.00)
+In demo mode, simulated P&L now uses the same simplified fee-adjusted binary model as live reporting:
+- Estimate gross shares from entry price: `gross_shares = stake / entry_price`
+- Estimate crypto taker fee: `fee = stake × 0.072 × (1 - entry_price)`
+- **Win:** `gross_shares - stake - fee`
+- **Lose:** `−1.0 × stake`
 
 ### Fixed vs PCT Stake Sizing
 
@@ -116,7 +118,7 @@ In demo mode, simulated P&L uses Polymarket-style binary payout:
 | **fixed** | `TRADE_MODE=fixed` | — | Fixed USDC amount per trade (set via `FIXED_STAKE`) |
 | **pct** | `TRADE_MODE=pct` | `TRADE_PCT=5.0` | Percentage of available balance per trade |
 
-In PCT demo mode: win = `0.85 × stake` profit, lose = full stake loss.
+In PCT demo mode, the stake is sized from the demo bankroll first, then resolved with the same fee-adjusted binary P&L model described above.
 
 ---
 
@@ -453,8 +455,8 @@ Before running with the ML strategy, train an initial model:
 | LGBM `num_leaves` | 63 | `trainer.py` | Tree complexity |
 | LGBM `learning_rate` | 0.05 | `trainer.py` | Step size |
 | Feature count | 40 | `ml/features.py` | Total engineered features |
-| Demo win payout | 0.85× stake | `trade_manager.py` | Simulated Polymarket payout |
-| Demo loss | 1.0× stake | `trade_manager.py` | Full stake loss on loss |
+| Demo win payout | fee-adjusted binary payout | `core/scheduler.py` | Simplified Polymarket-style win P&L based on entry price and crypto taker fee |
+| Demo loss | 1.0× stake | `core/scheduler.py` | Full stake loss on loss |
 
 ---
 

@@ -958,8 +958,8 @@ def format_retrain_blocked(meta: dict, threshold: float) -> tuple[str, str | Non
         data_line = ""
 
     # Payout ratio
-    payout     = meta.get("payout", 0.85)
-    payout_line = f"\u2502 \U0001f4b0 Payout:   {payout:.2f}  ({payout*100:.0f}\u00a2 per $1)\n"
+    payout     = meta.get("payout")
+    payout_line = f"\u2502 \U0001f4b0 Payout:   {payout:.2f}  ({payout*100:.0f}\u00a2 per $1)\n" if payout is not None else ""
 
     # UP EV/day
     up_ev      = meta.get("up_ev_per_day", 0.0)
@@ -1032,8 +1032,8 @@ def format_retrain_complete(meta: dict, threshold: float) -> tuple[str, str | No
         data_line = ""
 
     # Payout ratio
-    payout      = meta.get("payout", 0.85)
-    payout_line = f"\u2502 \U0001f4b0 Payout:   {payout:.2f}  ({payout*100:.0f}\u00a2 per $1)\n"
+    payout      = meta.get("payout")
+    payout_line = f"\u2502 \U0001f4b0 Payout:   {payout:.2f}  ({payout*100:.0f}\u00a2 per $1)\n" if payout is not None else ""
 
     # UP EV/day
     up_ev     = meta.get("up_ev_per_day", 0.0)
