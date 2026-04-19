@@ -61,7 +61,6 @@ COINBASE_CANDLE_URL: str = "https://api.exchange.coinbase.com/products/BTC-USD/c
 # ---------------------------------------------------------------------------
 ML_MODEL_DIR: str = os.path.join(os.path.dirname(__file__), "models")
 ML_DEFAULT_THRESHOLD: float = 0.535  # Blueprint Section 9: recommended threshold (64.22% WR @ ~50 trades/day)
-MEXC_CVD_URL: str = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT"
 
 # Payout ratio: fraction of stake returned as profit on a winning trade.
 # Polymarket binary markets typically pay $0.85 profit per $1 risked.

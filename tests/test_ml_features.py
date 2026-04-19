@@ -1,9 +1,10 @@
 import numpy as np
 import pandas as pd
+import pytest
 import sys
-sys.path.insert(0, '/home/nebula/nyxml4')
+sys.path.insert(0, '/home/nebula/nyxml4.6')
 
-from ml.features import compute_atr14, FEATURE_COLS
+from ml.features import compute_atr14, FEATURE_COLS, build_features, build_live_features, MissingLiveCVDDataError
 import config as cfg
 
 
@@ -33,7 +34,7 @@ def test_feature_order():
                 'atr_percentile_24h', 'vol_regime',
                 'rsi14', 'candle_streak', 'price_in_range', 'ema_cross_5m',
                 'body_vs_range5', 'range_expansion', 'vwap_dist_20',
-                'cvd_ratio', 'cvd_delta_norm']
+                'cvd_ratio', 'cvd_delta_norm', 'cvd_cumulative_5', 'cvd_cumulative_20', 'cvd_trend_slope', 'cvd_divergence', 'oi_change_5bar']
     assert FEATURE_COLS == expected
 
 
@@ -88,7 +89,7 @@ def test_asof_backward_vectorized_matches_searchsorted():
     the previous searchsorted row-loop implementation for all call sites:
     15m merge and 1h merge."""
     import sys
-    sys.path.insert(0, '/home/nebula/nyxml4')
+    sys.path.insert(0, '/home/nebula/nyxml4.6')
     from ml.features import _asof_backward
 
     rng = np.random.default_rng(0)
@@ -214,8 +215,9 @@ def test_live_features_match_training_for_latest_closed_5m_row():
         .reset_index()
     )
 
+    cvd = make_cvd_for_df5(df5, seed=707)
     # Training features on full history
-    train_feat = build_features(df5, df15, df1h)
+    train_feat = build_features(df5, df15, df1h, cvd)
     expected = train_feat[FEATURE_COLS].iloc[-2].to_numpy()
 
     # Live path semantics:
@@ -225,6 +227,7 @@ def test_live_features_match_training_for_latest_closed_5m_row():
         df5.iloc[:-1].copy(),
         df15.copy(),
         df1h.copy(),
+        cvd.copy(),
     )
 
     assert live_row is not None, f"build_live_features returned None; nan_features={nan_features}"
@@ -308,6 +311,16 @@ def make_aligned_data(n=500, seed=99):
     return df5, df15, df1h
 
 
+
+
+def make_cvd_for_df5(df5, seed=123):
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame({
+        "timestamp": df5["timestamp"].copy(),
+        "long_taker_size": rng.uniform(100, 1000, len(df5)),
+        "short_taker_size": rng.uniform(100, 1000, len(df5)),
+        "open_interest": rng.uniform(1000, 5000, len(df5)),
+    })
 def test_cvd_ratio_parity():
     """cvd_ratio = long_taker_size / (long + short), in [0, 1].
     Training: build_features() with explicit CVD DataFrame.
@@ -315,7 +328,7 @@ def test_cvd_ratio_parity():
     Both must equal the hand-computed reference AND each other.
     """
     from collections import deque
-    from ml.features import build_features, build_live_features, FEATURE_COLS
+    from ml.features import build_features, build_live_features, FEATURE_COLS, MissingLiveCVDDataError
 
     df5, df15, df1h = make_aligned_data(seed=11)
 
@@ -356,13 +369,14 @@ def test_body_vs_range5_parity():
     Both training and live must equal the hand-computed reference.
     """
     from collections import deque
-    from ml.features import build_features, build_live_features, FEATURE_COLS
+    from ml.features import build_features, build_live_features, FEATURE_COLS, MissingLiveCVDDataError
 
     df5, df15, df1h = make_aligned_data(seed=22)
 
-    train_feat = build_features(df5, df15, df1h)
+    cvd = make_cvd_for_df5(df5, seed=220)
+    train_feat = build_features(df5, df15, df1h, cvd)
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy())
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), cvd.copy())
 
     assert live_row is not None, f"live returned None; nan={nan_feats}"
 
@@ -411,13 +425,14 @@ def test_range_expansion_parity():
     Both must equal each other to floating-point precision.
     """
     from collections import deque
-    from ml.features import build_features, build_live_features, FEATURE_COLS
+    from ml.features import build_features, build_live_features, FEATURE_COLS, MissingLiveCVDDataError
 
     df5, df15, df1h = make_aligned_data(seed=33)
 
-    train_feat = build_features(df5, df15, df1h)
+    cvd = make_cvd_for_df5(df5, seed=330)
+    train_feat = build_features(df5, df15, df1h, cvd)
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy())
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), cvd.copy())
 
     assert live_row is not None, f"live returned None; nan={nan_feats}"
 
@@ -462,9 +477,10 @@ def test_vwap_dist_20_parity():
 
     df5, df15, df1h = make_aligned_data(seed=44)
 
-    train_feat = build_features(df5, df15, df1h)
+    cvd = make_cvd_for_df5(df5, seed=440)
+    train_feat = build_features(df5, df15, df1h, cvd)
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy())
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), cvd.copy())
 
     assert live_row is not None, f"live returned None; nan={nan_feats}"
 
@@ -501,11 +517,11 @@ def test_vwap_dist_20_parity():
 def test_structure_features_no_nan_in_normal_conditions():
     """All structure + CVD features must be non-NaN when data is plentiful and well-formed."""
     from collections import deque
-    from ml.features import build_features, build_live_features, FEATURE_COLS
+    from ml.features import build_features, build_live_features, FEATURE_COLS, MissingLiveCVDDataError
 
     df5, df15, df1h = make_aligned_data(n=500, seed=55)
-    # CVD defaults to neutral (0.5 / 0.0) when not provided — still non-NaN
-    train_feat = build_features(df5, df15, df1h)
+    cvd = make_cvd_for_df5(df5, seed=550)
+    train_feat = build_features(df5, df15, df1h, cvd)
 
     struct_feats = ["body_vs_range5", "range_expansion", "vwap_dist_20",
                     "cvd_ratio", "cvd_delta_norm"]
@@ -517,7 +533,7 @@ def test_structure_features_no_nan_in_normal_conditions():
             f"{feat}: {nan_count}/{total} NaN rows ({nan_count/total:.1%}) — exceeds 2% warmup allowance"
 
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy())
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), cvd.copy())
     assert live_row is not None, f"live returned None; nan={nan_feats}"
     for feat in struct_feats:
         i = FEATURE_COLS.index(feat)
@@ -529,7 +545,7 @@ def test_cvd_delta_norm_parity():
     Training and live must match each other to floating-point precision.
     """
     from collections import deque
-    from ml.features import build_features, build_live_features, FEATURE_COLS
+    from ml.features import build_features, build_live_features, FEATURE_COLS, MissingLiveCVDDataError
 
     df5, df15, df1h = make_aligned_data(seed=77)
 
@@ -595,3 +611,75 @@ def test_probability_diagnostics_compact_buckets():
     assert diag["label"] == "demo"
     assert len(diag["buckets"]) == 5
     assert diag["sample_count"] == 100
+
+
+
+def test_build_live_features_raises_when_cvd_missing():
+    base_ts = pd.Timestamp("2025-01-01T00:00:00Z")
+    n5, n15, n1h = 40, 30, 30
+    df5 = pd.DataFrame({
+        "timestamp": [base_ts + pd.Timedelta(minutes=5*i) for i in range(n5)],
+        "open": np.linspace(100, 139, n5),
+        "high": np.linspace(101, 140, n5),
+        "low": np.linspace(99, 138, n5),
+        "close": np.linspace(100.5, 139.5, n5),
+        "volume": np.linspace(10, 20, n5),
+    })
+    df15 = pd.DataFrame({
+        "timestamp": [base_ts + pd.Timedelta(minutes=15*i) for i in range(n15)],
+        "open": np.linspace(100, 129, n15),
+        "high": np.linspace(101, 130, n15),
+        "low": np.linspace(99, 128, n15),
+        "close": np.linspace(100.5, 129.5, n15),
+        "volume": np.linspace(10, 20, n15),
+    })
+    df1h = pd.DataFrame({
+        "timestamp": [base_ts + pd.Timedelta(hours=i) for i in range(n1h)],
+        "open": np.linspace(100, 129, n1h),
+        "high": np.linspace(101, 130, n1h),
+        "low": np.linspace(99, 128, n1h),
+        "close": np.linspace(100.5, 129.5, n1h),
+        "volume": np.linspace(10, 20, n1h),
+    })
+
+    with pytest.raises(MissingLiveCVDDataError):
+        build_live_features(df5, df15, df1h, None)
+
+
+def test_build_live_features_raises_when_cvd_does_not_align_to_n1():
+    base_ts = pd.Timestamp("2025-01-01T00:00:00Z")
+    n5, n15, n1h = 40, 30, 30
+    df5 = pd.DataFrame({
+        "timestamp": [base_ts + pd.Timedelta(minutes=5*i) for i in range(n5)],
+        "open": np.linspace(100, 139, n5),
+        "high": np.linspace(101, 140, n5),
+        "low": np.linspace(99, 138, n5),
+        "close": np.linspace(100.5, 139.5, n5),
+        "volume": np.linspace(10, 20, n5),
+    })
+    df15 = pd.DataFrame({
+        "timestamp": [base_ts + pd.Timedelta(minutes=15*i) for i in range(n15)],
+        "open": np.linspace(100, 129, n15),
+        "high": np.linspace(101, 130, n15),
+        "low": np.linspace(99, 128, n15),
+        "close": np.linspace(100.5, 129.5, n15),
+        "volume": np.linspace(10, 20, n15),
+    })
+    df1h = pd.DataFrame({
+        "timestamp": [base_ts + pd.Timedelta(hours=i) for i in range(n1h)],
+        "open": np.linspace(100, 129, n1h),
+        "high": np.linspace(101, 130, n1h),
+        "low": np.linspace(99, 128, n1h),
+        "close": np.linspace(100.5, 129.5, n1h),
+        "volume": np.linspace(10, 20, n1h),
+    })
+    # all CVD rows start after N-1
+    cvd = pd.DataFrame({
+        "timestamp": [df5["timestamp"].iloc[-1] + pd.Timedelta(minutes=5*i) for i in range(5)],
+        "long_taker_size": np.linspace(100, 104, 5),
+        "short_taker_size": np.linspace(90, 94, 5),
+        "open_interest": np.linspace(1000, 1004, 5),
+    })
+
+    with pytest.raises(MissingLiveCVDDataError):
+        build_live_features(df5, df15, df1h, cvd)

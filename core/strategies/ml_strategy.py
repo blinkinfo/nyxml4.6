@@ -253,11 +253,13 @@ class MLStrategy(BaseStrategy):
 
 
             # Build feature row — returns (row, nan_features) 2-tuple
-            feature_row, nan_features = feat_eng.build_live_features(
-                df5, df15, df1h, cvd_live
-            )
-            if feature_row is None:
-                log.warning("MLStrategy: insufficient data for features, skipping")
+
+            try:
+                feature_row, nan_features = feat_eng.build_live_features(
+                    df5, df15, df1h, cvd_live
+                )
+            except feat_eng.MissingLiveCVDDataError as exc:
+                log.warning("MLStrategy: %s", exc)
                 inference_logger.log_inference(
                     slot_slug=slug,
                     slot_ts=slot_ts,
@@ -272,7 +274,7 @@ class MLStrategy(BaseStrategy):
                     candle_n1_vol=candle_n1_vol,
                     feature_names=FEATURE_COLS,
                     feature_row=None,
-                    nan_features=nan_features,
+                    nan_features=[],
                     p_up=None,
                     p_down=None,
                     up_threshold=None,
@@ -280,10 +282,9 @@ class MLStrategy(BaseStrategy):
                     down_enabled=False,
                     fired=False,
                     side=None,
-                    skip_reason="Insufficient data for features"
-                    + (f" (NaN: {nan_features})" if nan_features else ""),
+                    skip_reason=f"Missing required Gate CVD: {exc}",
                 )
-                return {**base_fields, "reason": "Insufficient data for features"}
+                return {**base_fields, "reason": f"Missing required Gate CVD: {exc}"}
 
             metadata = model_store.load_metadata(self._model_slot) or {}
             calibration_metadata_present, calibration_metadata_method = _calibration_metadata_status(metadata)

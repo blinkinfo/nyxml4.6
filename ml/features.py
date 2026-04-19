@@ -28,6 +28,24 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Feature column order — MUST match exactly (40 features)
 # ---------------------------------------------------------------------------
+
+class MissingLiveCVDDataError(RuntimeError):
+    """Raised when live inference cannot build CVD-derived features safely."""
+
+
+def _normalize_cvd_input(cvd: pd.DataFrame | None) -> pd.DataFrame:
+    """Normalize any accepted CVD input into the canonical Gate-style schema."""
+    if cvd is None or cvd.empty:
+        return pd.DataFrame(columns=["timestamp", "long_taker_size", "short_taker_size", "open_interest"])
+
+    out = cvd.copy().reset_index(drop=True)
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True).astype("datetime64[ms, UTC]")
+    for col in ["long_taker_size", "short_taker_size", "open_interest"]:
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0).astype(float)
+    return out[["timestamp", "long_taker_size", "short_taker_size", "open_interest"]].sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
+
 FEATURE_COLS = [
     "body_ratio_n1", "body_ratio_n2", "body_ratio_n3",
     "upper_wick_n1", "upper_wick_n2",
@@ -369,9 +387,7 @@ def build_features(
     )
 
     if cvd_available:
-        cvd_clean = cvd.copy().reset_index(drop=True)
-        cvd_clean["timestamp"] = cvd_clean["timestamp"].astype("datetime64[ms, UTC]")
-        cvd_clean = cvd_clean.sort_values("timestamp").reset_index(drop=True)
+        cvd_clean = _normalize_cvd_input(cvd)
 
         # Derive ratio and delta directly on the CVD frame before merging
         _total = (cvd_clean["long_taker_size"] + cvd_clean["short_taker_size"]).clip(lower=1e-9)
@@ -580,9 +596,9 @@ def build_live_features(
         cvd_live:           Gate.io 5m taker volume DataFrame
                             (columns: timestamp, long_taker_size, short_taker_size,
                             open_interest).
-                            If None or empty, cvd_ratio defaults to 0.5,
-                            cvd_delta_norm to 0.0, and all accumulation/OI
-                            features to 0.0 (neutral — no bias applied).
+                            This input is required for live inference. If Gate CVD
+                            is unavailable or cannot be aligned to the N-1 candle,
+                            live inference fails closed instead of neutralizing CVD.
     """
     # Validate ATR warmup
     if len(df5_live) < 14:
@@ -948,24 +964,24 @@ def build_live_features(
         and "short_taker_size" in cvd_live.columns
     )
 
-    # neutral defaults — used on any failure path
-    cvd_ratio_live         = 0.5
-    cvd_delta_norm_live    = 0.0
-    cvd_cumulative_5_live  = 0.0
-    cvd_cumulative_20_live = 0.0
-    cvd_trend_slope_live   = 0.0
-    cvd_divergence_live    = 0.0
-    oi_change_5bar_live    = 0.0
+    if not cvd_live_available:
+        raise MissingLiveCVDDataError("Gate CVD unavailable for live inference")
+
+    cvd_ratio_live = cvd_delta_norm_live = None
+    cvd_cumulative_5_live = cvd_cumulative_20_live = None
+    cvd_trend_slope_live = cvd_divergence_live = None
+    oi_change_5bar_live = None
 
     if cvd_live_available:
         # ts_n1_for_cvd: N-1 timestamp. df5[-1] is forming candle N, df5[-2] is N-1.
         ts_n1_for_cvd = df5["timestamp"].iloc[-2] if len(df5) >= 2 else None
         if ts_n1_for_cvd is not None and not pd.isna(ts_n1_for_cvd):
-            _cvd_ts = pd.to_datetime(cvd_live["timestamp"], utc=True).astype("datetime64[ms, UTC]")
+            cvd_live_clean = _normalize_cvd_input(cvd_live)
+            _cvd_ts = cvd_live_clean["timestamp"]
             _mask_cvd = _cvd_ts <= pd.Timestamp(ts_n1_for_cvd)
             if _mask_cvd.any():
                 # Full slice of CVD bars up to and including N-1
-                _cvd_slice = cvd_live[_mask_cvd].reset_index(drop=True)
+                _cvd_slice = cvd_live_clean[_mask_cvd].reset_index(drop=True)
                 _cvd_row = _cvd_slice.iloc[-1]
 
                 # --- cvd_ratio and cvd_delta_norm (single bar N-1) ---
@@ -981,28 +997,37 @@ def build_live_features(
                 _sts_arr = _cvd_slice["short_taker_size"].astype(float).values
                 _delta_arr = _lts_arr - _sts_arr  # shape (K,), last element = N-1 bar
 
+                # Match training's ATR alignment on the CVD frame:
+                # each CVD bar uses ATR of its corresponding 5m candle, then shift(1)
+                # for cumulative/slope features.
+                _df5_atr_live = pd.DataFrame({
+                    "timestamp": df5["timestamp"].values,
+                    "atr5_for_cvd": atr5.values,
+                })
+                _atr_merged_live = _asof_backward(_cvd_slice["timestamp"], _df5_atr_live, ["atr5_for_cvd"])
+                _cvd_atr_live = _atr_merged_live["atr5_for_cvd"].clip(lower=1e-9).values
+                _atr_hist = _cvd_atr_live[:-1]
+
                 # Training uses rolling(N).sum().shift(1) on the CVD frame, then
                 # merges at ts_n1 (N-1 bar). The shift(1) means the value stored at
                 # CVD bar index t is the rolling sum of bars [t-N .. t-1] — it does
                 # NOT include bar t itself. So when merged at N-1, the window ends at
                 # N-2 (one bar before N-1).
-                #
-                # Live fix: exclude the last element (_delta_arr[-1] = N-1) from all
-                # rolling computations by working on _delta_hist = _delta_arr[:-1].
-                # This gives a window ending at N-2, exactly matching training.
                 _delta_hist = _delta_arr[:-1]  # bars up to N-2 (training-equivalent)
 
-                # cvd_cumulative_5: sum of last 5 bars ending at N-2
+                # cvd_cumulative_5 / 20: use ATR at the matched shifted CVD bar like training
                 if len(_delta_hist) >= 2:
                     _slice5  = _delta_hist[max(0, len(_delta_hist) - 5):]
                     _slice20 = _delta_hist[max(0, len(_delta_hist) - 20):]
-                    cvd_cumulative_5_live  = float(np.sum(_slice5)  / max(atr5_val, 1e-9))
-                    cvd_cumulative_20_live = float(np.sum(_slice20) / max(atr5_val, 1e-9))
+                    _atr_for_cum = max(float(_atr_hist[-1]), 1e-9) if len(_atr_hist) else 1e-9
+                    cvd_cumulative_5_live  = float(np.sum(_slice5)  / _atr_for_cum)
+                    cvd_cumulative_20_live = float(np.sum(_slice20) / _atr_for_cum)
                 else:
                     cvd_cumulative_5_live  = 0.0
                     cvd_cumulative_20_live = 0.0
 
-                # cvd_trend_slope: OLS slope over last 10 bars ending at N-2
+                # cvd_trend_slope: OLS slope over last 10 bars ending at N-2,
+                # normalized by the shifted CVD-bar ATR like training.
                 if len(_delta_hist) >= 3:
                     _slope_vals = _delta_hist[max(0, len(_delta_hist) - 10):]
                     _v = _slope_vals[~np.isnan(_slope_vals)]
@@ -1012,7 +1037,8 @@ def build_live_features(
                             _slope = float(np.polyfit(_x, _v, 1)[0])
                         except Exception:
                             _slope = 0.0
-                        cvd_trend_slope_live = float(_slope / max(atr5_val, 1e-9))
+                        _atr_for_slope = max(float(_atr_hist[-1]), 1e-9) if len(_atr_hist) else 1e-9
+                        cvd_trend_slope_live = float(_slope / _atr_for_slope)
                     else:
                         cvd_trend_slope_live = 0.0
                 else:
@@ -1054,16 +1080,11 @@ def build_live_features(
                     oi_change_5bar_live = 0.0
 
             else:
-                log.debug(
-                    "build_live_features: no CVD candle at or before ts_n1=%s — using neutrals",
-                    ts_n1_for_cvd,
+                raise MissingLiveCVDDataError(
+                    f"Gate CVD has no candle at or before ts_n1={ts_n1_for_cvd}"
                 )
-        # else: ts_n1_for_cvd is None/NaT — neutrals already set above
-    else:
-        log.debug(
-            "build_live_features: cvd_live not provided or empty — "
-            "using neutral defaults for all CVD/OI features"
-        )
+        else:
+            raise MissingLiveCVDDataError("Gate CVD cannot align because ts_n1 is missing")
 
     row = np.array([[
         body_ratio_n1, body_ratio_n2, body_ratio_n3,
