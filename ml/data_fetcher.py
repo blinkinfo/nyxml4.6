@@ -22,6 +22,51 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+CVD_COLUMNS = ["timestamp", "long_taker_size", "short_taker_size", "open_interest"]
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def empty_cvd_frame() -> pd.DataFrame:
+    """Return an empty Gate-style CVD frame with the canonical schema."""
+    return pd.DataFrame(columns=CVD_COLUMNS)
+
+
+def normalize_gate_cvd(cvd: pd.DataFrame | None) -> pd.DataFrame:
+    """Normalize Gate CVD rows into the canonical schema used by training and live.
+
+    Accepts raw parsed records or any frame containing the canonical columns,
+    coerces timestamp to UTC millisecond precision, numeric fields to float,
+    sorts ascending, and de-duplicates on timestamp.
+    """
+    if cvd is None or cvd.empty:
+        return empty_cvd_frame()
+
+    out = cvd.copy().reset_index(drop=True)
+    if "timestamp" not in out.columns:
+        return empty_cvd_frame()
+
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    out = out.dropna(subset=["timestamp"]).reset_index(drop=True)
+    if out.empty:
+        return empty_cvd_frame()
+
+    out["timestamp"] = out["timestamp"].astype("datetime64[ms, UTC]")
+    for col in ["long_taker_size", "short_taker_size", "open_interest"]:
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0).astype(float)
+
+    return (
+        out[CVD_COLUMNS]
+        .sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"])
+        .reset_index(drop=True)
+    )
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
